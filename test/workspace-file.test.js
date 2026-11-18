@@ -3,7 +3,7 @@ import { mkdir, mkdtemp, readFile, realpath, rm, symlink, writeFile } from 'node
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { chooseFileName, fileNameFromDisposition, sanitizeFileName, saveWorkspaceFile } from '../lib/workspace-file.js'
+import { chooseFileName, fileNameFromDisposition, isSimpleFileName, sanitizeFileName, saveWorkspaceFile } from '../lib/workspace-file.js'
 
 describe('file name selection', () => {
   it('prefers RFC 5987 filename* over filename', () => {
@@ -16,6 +16,13 @@ describe('file name selection', () => {
     assert.equal(sanitizeFileName('../../etc/passwd'), '_.._etc_passwd')
     assert.equal(sanitizeFileName('..'), undefined)
     assert.equal(sanitizeFileName('a\u0000b:c.pdf'), 'a_b_c.pdf')
+  })
+
+  it('accepts only names that are already safe', () => {
+    assert.equal(isSimpleFileName('Invoice 42.pdf'), true)
+    for (const name of ['', '.', '..', 'a.', ' a', 'a/b', 'a\\b', 'a\u0001', 'x'.repeat(201)]) {
+      assert.equal(isSimpleFileName(name), false, JSON.stringify(name))
+    }
   })
 
   it('falls back from the explicit name to the header, the URL, then a default', () => {
@@ -43,7 +50,7 @@ describe('saveWorkspaceFile', () => {
 
   it('writes into .tmp/downloads/ by default and reports a cwd-relative path', async () => {
     const data = Buffer.from('%PDF-1.7 test')
-    const saved = await saveWorkspaceFile({ workspaceRoot: root, cwd: root, fileName: 'a.pdf', data })
+    const saved = await saveWorkspaceFile({ writableRoots: [root], cwd: root, fileName: 'a.pdf', data })
     assert.equal(saved.path, join(root, '.tmp', 'downloads', 'a.pdf'))
     assert.equal(saved.relativePath, '.tmp/downloads/a.pdf')
     assert.equal(saved.bytes, data.length)
@@ -52,8 +59,8 @@ describe('saveWorkspaceFile', () => {
   })
 
   it('never overwrites: a second save gets a numbered name', async () => {
-    const first = await saveWorkspaceFile({ workspaceRoot: root, cwd: root, directory: 'invoices', fileName: 'a.pdf', data: Buffer.from('1') })
-    const second = await saveWorkspaceFile({ workspaceRoot: root, cwd: root, directory: 'invoices', fileName: 'a.pdf', data: Buffer.from('2') })
+    const first = await saveWorkspaceFile({ writableRoots: [root], cwd: root, directory: 'invoices', fileName: 'a.pdf', data: Buffer.from('1') })
+    const second = await saveWorkspaceFile({ writableRoots: [root], cwd: root, directory: 'invoices', fileName: 'a.pdf', data: Buffer.from('2') })
     assert.equal(second.path, join(root, 'invoices', 'a (1).pdf'))
     assert.equal(await readFile(first.path, 'utf8'), '1')
     assert.equal(await readFile(second.path, 'utf8'), '2')
@@ -62,23 +69,23 @@ describe('saveWorkspaceFile', () => {
   it('resolves relative directories against the current directory', async () => {
     const cwd = join(root, 'project')
     await mkdir(cwd)
-    const saved = await saveWorkspaceFile({ workspaceRoot: root, cwd, directory: '../shared', fileName: 'a.pdf', data: Buffer.from('x') })
+    const saved = await saveWorkspaceFile({ writableRoots: [root], cwd, directory: '../shared', fileName: 'a.pdf', data: Buffer.from('x') })
     assert.equal(saved.path, join(root, 'shared', 'a.pdf'))
   })
 
   it('rejects directories outside the workspace', async () => {
     await assert.rejects(
-      saveWorkspaceFile({ workspaceRoot: root, cwd: root, directory: outside, fileName: 'a.pdf', data: Buffer.from('x') }),
+      saveWorkspaceFile({ writableRoots: [root], cwd: root, directory: outside, fileName: 'a.pdf', data: Buffer.from('x') }),
       /inside the session workspace/u)
     await assert.rejects(
-      saveWorkspaceFile({ workspaceRoot: root, cwd: root, directory: '../escape', fileName: 'a.pdf', data: Buffer.from('x') }),
+      saveWorkspaceFile({ writableRoots: [root], cwd: root, directory: '../escape', fileName: 'a.pdf', data: Buffer.from('x') }),
       /inside the session workspace/u)
   })
 
   it('rejects a symlinked directory that points outside, without creating anything there', async () => {
     await symlink(outside, join(root, 'link'))
     await assert.rejects(
-      saveWorkspaceFile({ workspaceRoot: root, cwd: root, directory: 'link/new', fileName: 'a.pdf', data: Buffer.from('x') }),
+      saveWorkspaceFile({ writableRoots: [root], cwd: root, directory: 'link/new', fileName: 'a.pdf', data: Buffer.from('x') }),
       /inside the session workspace/u)
     await assert.rejects(readFile(join(outside, 'new', 'a.pdf')))
     await assert.rejects(realpath(join(outside, 'new')))
@@ -88,14 +95,27 @@ describe('saveWorkspaceFile', () => {
     await mkdir(join(root, '.tmp', 'downloads'), { recursive: true })
     await writeFile(join(outside, 'victim'), 'keep')
     await symlink(join(outside, 'victim'), join(root, '.tmp', 'downloads', 'a.pdf'))
-    const saved = await saveWorkspaceFile({ workspaceRoot: root, cwd: root, fileName: 'a.pdf', data: Buffer.from('x') })
+    const saved = await saveWorkspaceFile({ writableRoots: [root], cwd: root, fileName: 'a.pdf', data: Buffer.from('x') })
     assert.equal(saved.path, join(root, '.tmp', 'downloads', 'a (1).pdf'))
     assert.equal(await readFile(join(outside, 'victim'), 'utf8'), 'keep')
   })
 
+  it('writes into an extra writable root the policy grants', async () => {
+    const saved = await saveWorkspaceFile({ writableRoots: [root, outside], cwd: root, directory: outside, fileName: 'a.pdf', data: Buffer.from('x') })
+    assert.equal(saved.path, join(outside, 'a.pdf'))
+    assert.equal(saved.relativePath.startsWith('../'), true)
+  })
+
+  it('reports relativePath from the canonical working directory when cwd is a symlink', async () => {
+    const linkedCwd = join(outside, 'cwd-link')
+    await symlink(root, linkedCwd)
+    const saved = await saveWorkspaceFile({ writableRoots: [root], cwd: linkedCwd, fileName: 'a.pdf', data: Buffer.from('x') })
+    assert.equal(saved.relativePath, '.tmp/downloads/a.pdf')
+  })
+
   it('rejects unsafe file names', async () => {
     await assert.rejects(
-      saveWorkspaceFile({ workspaceRoot: root, cwd: root, fileName: '../a.pdf', data: Buffer.from('x') }),
+      saveWorkspaceFile({ writableRoots: [root], cwd: root, fileName: '../a.pdf', data: Buffer.from('x') }),
       /file name is invalid/u)
   })
 })

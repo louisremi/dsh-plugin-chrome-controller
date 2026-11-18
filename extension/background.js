@@ -703,6 +703,12 @@ function delay(ms, signal) {
   })
 }
 
+/** Allow large results (file bytes) time to upload: 10 s plus 10 s per MB of base64. */
+function responseTimeoutMs(result) {
+  const encoded = typeof result?.base64 === 'string' ? result.base64.length : 0
+  return 10_000 + Math.ceil(encoded / (1024 * 1024)) * 10_000
+}
+
 async function postJson(origin, path, payload, sessionSignal, timeoutMs = 10_000) {
   const controller = new AbortController()
   const abortFromSession = () => controller.abort(sessionSignal.reason)
@@ -925,7 +931,7 @@ async function handleBrowserRequest(session, command, signal, commandSignal) {
       id: command.id,
       ok: true,
       result,
-    }, signal)
+    }, signal, responseTimeoutMs(result))
     if (dragTraceId !== undefined) logDragTrace(dragTraceId, 'response-post-finished')
   } catch (error) {
     if (dragTraceId !== undefined) logDragTrace(dragTraceId, 'operation-or-response-error', {
@@ -1380,7 +1386,7 @@ async function executeBrowserOperationNow(method, params, signal) {
       })
     }
     case 'page.fetchFile':
-      return fetchFileInTab(params)
+      return fetchFileWithTabSession(params)
     case 'downloads.start':
       return startDownload(params)
     case 'downloads.status':
@@ -4711,40 +4717,52 @@ function extractPage(params) {
 }
 
 /**
- * Fetch one URL from inside a tab frame so the request carries that page's
- * cookies, origin, and network path, and return the bytes as base64. When the
- * page cannot read the response (a cross-origin URL without CORS), retry from
- * the service worker, whose host permissions allow the read.
+ * Fetch one URL with a tab frame's session and return the bytes as base64.
+ * The request runs inside the frame so it carries that page's cookies, origin,
+ * and network path. Only when the page received a response it may not read
+ * (a cross-origin URL without CORS) does the service worker retry, using its
+ * host permissions and the browser's cookies for that site.
  */
-async function fetchFileInTab(params) {
+async function fetchFileWithTabSession(params) {
   const tabId = requireTabId(params.tabId)
   const frameId = params.frameId === undefined ? 0 : requireFrameId(params.frameId)
   const url = httpUrl(params.url)
   const parsedUrl = new URL(url)
   if (parsedUrl.username || parsedUrl.password) throw new Error('Download URLs cannot contain embedded credentials')
-  let payload = await runInFrame(tabId, frameId, frameFetchFilePayload, [url, MAX_FETCH_FILE_BYTES])
-  if (isRecord(payload) && payload.unreadable === true) {
-    payload = await frameFetchFilePayload(url, MAX_FETCH_FILE_BYTES)
-    if (isRecord(payload)) payload.via = 'extension'
+  let payload = await runInFrame(tabId, frameId, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
+  if (isRecord(payload) && payload.blockedByCors === true) {
+    payload = await fetchFileAsBase64(url, MAX_FETCH_FILE_BYTES, 'extension')
   }
   if (!isRecord(payload)) throw new Error('The tab returned no download result')
   if (typeof payload.error === 'string') throw new Error(payload.error)
   return { tabId, frameId, ...payload }
 }
 
-/** Runs in the tab frame (and as a service-worker fallback): fetch one URL and encode its body. */
-async function frameFetchFilePayload(url, maxBytes) {
+/**
+ * Fetch one URL and encode its body. Self-contained: it runs inside the tab
+ * frame (via) 'page', and in the service worker as via 'extension'.
+ * A page fetch that fails before any response is retried without CORS only
+ * when a no-cors probe shows the server answered, so plain network failures
+ * are reported instead of retried.
+ */
+async function fetchFileAsBase64(url, maxBytes, via) {
+  const requester = via === 'page' ? 'The page' : 'The extension'
   let response
   try {
     response = await fetch(url, { credentials: 'include', cache: 'no-store', redirect: 'follow' })
   } catch (error) {
-    // A TypeError here is a CORS or network refusal the caller may retry elsewhere.
-    return { unreadable: true, error: 'The page could not fetch the URL: ' + String(error?.message ?? error) }
+    if (via === 'page') {
+      try {
+        await fetch(url, { mode: 'no-cors', credentials: 'include', cache: 'no-store', redirect: 'follow' })
+        return { blockedByCors: true }
+      } catch {}
+    }
+    return { error: requester + ' could not fetch the URL: ' + String(error?.message ?? error) }
   }
   if (response.type === 'opaque' || response.type === 'opaqueredirect') {
-    return { unreadable: true, error: 'The response is not readable from the page' }
+    return via === 'page' ? { blockedByCors: true } : { error: requester + ' cannot read the response' }
   }
-  if (!response.ok) return { error: 'The download request failed with HTTP status ' + String(response.status) }
+  if (!response.ok) return { error: requester + ' request failed with HTTP status ' + String(response.status) }
   const declared = Number(response.headers.get('content-length'))
   if (Number.isFinite(declared) && declared > maxBytes) {
     return { error: 'The file is larger than the ' + String(maxBytes) + '-byte limit' }
@@ -4757,7 +4775,7 @@ async function frameFetchFilePayload(url, maxBytes) {
     binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000))
   }
   return {
-    via: 'page',
+    via,
     finalUrl: response.url || url,
     status: response.status,
     contentType: response.headers.get('content-type') ?? '',
@@ -4773,9 +4791,10 @@ async function startDownload(params) {
   if (parsedUrl.username || parsedUrl.password) throw new Error('Download URLs cannot contain embedded credentials')
   const options = { url, saveAs: params.saveAs !== false }
   if (params.filename !== undefined) {
-    if (typeof params.filename !== 'string' || params.filename.trim() === ''
-      || params.filename.length > 255 || /[\\/:*?"<>|]/u.test(params.filename)
-      || params.filename === '.' || params.filename === '..') {
+    // Same rule as the plugin's isSimpleFileName: no separators, reserved or
+    // control characters, leading/trailing dots or spaces, at most 200 characters.
+    if (typeof params.filename !== 'string' || params.filename.length === 0 || params.filename.length > 200
+      || /[\\/:*?"<>|\u0000-\u001f\u007f]/u.test(params.filename) || /^[.\s]|[.\s]$/u.test(params.filename)) {
       throw new Error('filename must be a simple file name without path separators')
     }
     options.filename = params.filename

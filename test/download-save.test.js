@@ -10,14 +10,14 @@ const EXTENSION_ORIGIN = 'chrome-extension://' + 'b'.repeat(32)
 const PAIRING_KEY = 'dsh-plugin-chrome-controller/pairing-code'
 
 /** A plugin context complete enough to apply the whole plugin. */
-function fakePluginContext({ mode = 'workspace-write', root }) {
+function fakePluginContext({ mode = 'workspace-write', root, withServices = true }) {
   const routes = new Map()
   const tools = new Map()
   const records = new Map()
-  const services = {
+  const services = withServices ? {
     sandboxPolicy: { resolve: () => ({ mode, workspaceRoot: root }) },
     workingDirectory: { ensure: async () => root },
-  }
+  } : {}
   const disposers = []
   return {
     routes,
@@ -126,6 +126,25 @@ describe('dsh_browser_save_file', () => {
     await pairAndAnswer(context, () => ({}))
     const tool = context.registered.get('dsh_browser_save_file')
     await assert.rejects(tool.execute({ tabId: 7, url: 'https://shop.test/a.pdf' }, exec()), /read-only/u)
+  })
+
+  it('fails closed when the profile has no sandbox-policy service', async () => {
+    context = fakePluginContext({ root, withServices: false })
+    await apply(context)
+    await pairAndAnswer(context, () => ({}))
+    await assert.rejects(
+      context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: 'https://shop.test/a.pdf' }, exec()),
+      /no working-directory or sandbox-policy service/u)
+  })
+
+  it('rejects arguments that do not apply to the dsh_browser_download action', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    await pairAndAnswer(context, () => ({}))
+    const download = context.registered.get('dsh_browser_download')
+    await assert.rejects(download.execute({ action: 'status', downloadId: 1, url: 'https://shop.test/a.pdf' }, exec()), /url does not apply to action status/u)
+    await assert.rejects(download.execute({ action: 'start', url: 'https://shop.test/a.pdf', downloadId: 1 }, exec()), /downloadId does not apply to action start/u)
+    await assert.rejects(download.execute({ action: 'start', url: 'https://shop.test/a.pdf', filename: 'a.' }, exec()), /simple file name/u)
   })
 
   it('requires a tab for save', async () => {
