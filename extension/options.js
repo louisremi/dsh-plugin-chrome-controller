@@ -182,7 +182,7 @@ async function initialize() {
   updatePairingPage()
 }
 
-/** Accept only loopback HTTP(S) origins; empty resets to the default. */
+/** Accept loopback HTTP(S) or remote HTTPS origins; empty resets to the default. */
 function readOrigin() {
   const raw = originInput.value.trim()
   if (raw === '') return DEFAULT_DSH_ORIGIN
@@ -193,13 +193,14 @@ function readOrigin() {
     return undefined
   }
   if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-  if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost' && url.hostname !== '[::1]') return undefined
+  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
+  if (!loopback && url.protocol !== 'https:') return undefined
   return url.origin
 }
 
 function updatePairingPage() {
   const origin = readOrigin()
-  pairingPageNode.textContent = origin === undefined ? 'Enter a valid local address' : origin + PAIRING_SETTINGS_PATH
+  pairingPageNode.textContent = origin === undefined ? 'Enter a loopback or HTTPS address' : origin + PAIRING_SETTINGS_PATH
 }
 
 originInput.addEventListener('input', updatePairingPage)
@@ -208,7 +209,7 @@ connectionForm.addEventListener('submit', async event => {
   event.preventDefault()
   const origin = readOrigin()
   if (origin === undefined) {
-    originInput.setCustomValidity('Enter a local address such as http://127.0.0.1:3080')
+    originInput.setCustomValidity('Enter a loopback address such as http://127.0.0.1:3080, or an HTTPS address such as https://dsh.example.com')
     originInput.reportValidity()
     return
   }
