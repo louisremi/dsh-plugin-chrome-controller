@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
@@ -111,13 +111,25 @@ describe('dsh_browser_save_file', () => {
   it('saves into .tmp/downloads by default and leaves dsh_browser_download unchanged', async () => {
     context = fakePluginContext({ root })
     await apply(context)
-    const answer = await pairAndAnswer(context, () => ({ via: 'page', finalUrl: 'https://shop.test/a.pdf', contentType: 'application/pdf', bytes: 1, base64: 'eA==' }))
+    const pdf = Buffer.from('%PDF-1.4 x')
+    const answer = await pairAndAnswer(context, () => ({ via: 'page', finalUrl: 'https://shop.test/a.pdf', contentType: 'application/pdf', bytes: pdf.length, base64: pdf.toString('base64') }))
     const pending = context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: 'https://shop.test/a.pdf' }, exec())
     await answer()
     assert.equal((await pending).relativePath, '.tmp/downloads/a.pdf')
     const download = context.registered.get('dsh_browser_download')
     assert.deepEqual(download.parameters.properties.action.enum, ['start', 'status', 'cancel'])
     await assert.rejects(download.execute({ action: 'save', url: 'https://shop.test/a.pdf' }, exec()), /Invalid value for browser argument: action/u)
+  })
+
+  it('refuses an HTML error page served for a PDF link and writes nothing', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const page = Buffer.from('<html><head><title>Toutes nos excuses</title></head><body>Erreur</body></html>')
+    const answer = await pairAndAnswer(context, () => ({ via: 'page', finalUrl: 'https://shop.test/inv/invoice.pdf', status: 200, contentType: 'text/html', bytes: page.length, base64: page.toString('base64') }))
+    const pending = context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: 'https://shop.test/inv/invoice.pdf', directory: 'invoices' }, exec())
+    await answer()
+    await assert.rejects(pending, /Expected a PDF for invoice\.pdf, but received an HTML page titled "Toutes nos excuses"/u)
+    await assert.rejects(readdir(join(root, 'invoices')), { code: 'ENOENT' })
   })
 
   it('refuses to save under a read-only session file policy', async () => {

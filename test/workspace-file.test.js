@@ -29,8 +29,8 @@ describe('file name selection', () => {
     assert.equal(chooseFileName({ requested: 'mine.pdf', contentDisposition: 'attachment; filename="x.pdf"', url: 'https://e.test/y.pdf' }), 'mine.pdf')
     assert.equal(chooseFileName({ contentDisposition: 'attachment; filename="x.pdf"', url: 'https://e.test/y.pdf' }), 'x.pdf')
     assert.equal(chooseFileName({ url: 'https://e.test/docs/y%20z.pdf?sig=1' }), 'y z.pdf')
-    assert.equal(chooseFileName({ url: 'https://e.test/', contentType: 'application/pdf; charset=binary' }), 'download.pdf')
-    assert.equal(chooseFileName({ url: 'https://e.test/invoice', contentType: 'application/pdf' }), 'invoice.pdf')
+    assert.equal(chooseFileName({ url: 'https://e.test/' }), 'download')
+    assert.equal(chooseFileName({ url: 'https://e.test/invoice' }), 'invoice')
   })
 })
 
