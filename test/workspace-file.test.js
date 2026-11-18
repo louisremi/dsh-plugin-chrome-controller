@@ -41,11 +41,11 @@ describe('saveWorkspaceFile', () => {
     await rm(outside, { recursive: true, force: true })
   })
 
-  it('writes into downloads/ by default and reports a cwd-relative path', async () => {
+  it('writes into .tmp/downloads/ by default and reports a cwd-relative path', async () => {
     const data = Buffer.from('%PDF-1.7 test')
     const saved = await saveWorkspaceFile({ workspaceRoot: root, cwd: root, fileName: 'a.pdf', data })
-    assert.equal(saved.path, join(root, 'downloads', 'a.pdf'))
-    assert.equal(saved.relativePath, 'downloads/a.pdf')
+    assert.equal(saved.path, join(root, '.tmp', 'downloads', 'a.pdf'))
+    assert.equal(saved.relativePath, '.tmp/downloads/a.pdf')
     assert.equal(saved.bytes, data.length)
     assert.match(saved.sha256, /^[0-9a-f]{64}$/u)
     assert.deepEqual(await readFile(saved.path), data)
@@ -85,11 +85,11 @@ describe('saveWorkspaceFile', () => {
   })
 
   it('does not follow a planted symlink at the target name', async () => {
-    await mkdir(join(root, 'downloads'))
+    await mkdir(join(root, '.tmp', 'downloads'), { recursive: true })
     await writeFile(join(outside, 'victim'), 'keep')
-    await symlink(join(outside, 'victim'), join(root, 'downloads', 'a.pdf'))
+    await symlink(join(outside, 'victim'), join(root, '.tmp', 'downloads', 'a.pdf'))
     const saved = await saveWorkspaceFile({ workspaceRoot: root, cwd: root, fileName: 'a.pdf', data: Buffer.from('x') })
-    assert.equal(saved.path, join(root, 'downloads', 'a (1).pdf'))
+    assert.equal(saved.path, join(root, '.tmp', 'downloads', 'a (1).pdf'))
     assert.equal(await readFile(join(outside, 'victim'), 'utf8'), 'keep')
   })
 
