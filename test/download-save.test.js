@@ -1,0 +1,125 @@
+import assert from 'node:assert/strict'
+import { mkdtemp, readFile, realpath, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { Readable } from 'node:stream'
+import { afterEach, beforeEach, describe, it } from 'node:test'
+import { apply } from '../lib/index.js'
+
+const EXTENSION_ORIGIN = 'chrome-extension://' + 'b'.repeat(32)
+const PAIRING_KEY = 'dsh-plugin-chrome-controller/pairing-code'
+
+/** A plugin context complete enough to apply the whole plugin. */
+function fakePluginContext({ mode = 'workspace-write', root }) {
+  const routes = new Map()
+  const tools = new Map()
+  const records = new Map()
+  const services = {
+    sandboxPolicy: { resolve: () => ({ mode, workspaceRoot: root }) },
+    workingDirectory: { ensure: async () => root },
+  }
+  const disposers = []
+  return {
+    routes,
+    registered: tools,
+    disposers,
+    skills: { register() {} },
+    systemPrompt: { section() {}, getSectionOrder: () => 0 },
+    tools: { register(tool) { tools.set(tool.name, tool) } },
+    webServer: { register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path) } },
+    connection: { fetch: { register: () => () => {} }, requestRejection: () => 401 },
+    credentials: {
+      async readRecord(key) { return records.get(key) },
+      async modifyRecord(key, update) {
+        const next = await update(records.get(key))
+        if (next !== undefined) records.set(key, next)
+        return records.get(key)
+      },
+    },
+    on: () => () => {},
+    effect(factory) { disposers.push(factory()) },
+    get: name => services[name],
+  }
+}
+
+async function call(context, path, body) {
+  const request = Readable.from([Buffer.from(JSON.stringify(body))])
+  request.method = 'POST'
+  request.headers = { host: '127.0.0.1:3080', origin: EXTENSION_ORIGIN }
+  request.socket = { remoteAddress: '127.0.0.1' }
+  let text = ''
+  const response = {
+    destroyed: false,
+    writeHead() {},
+    end(chunk) { if (chunk !== undefined) text += String(chunk) },
+    once() {},
+    removeListener() {},
+  }
+  await context.routes.get('/dsh-browser-extension/' + path)(request, response)
+  return text === '' ? undefined : JSON.parse(text)
+}
+
+/** Pair a fake extension, then answer the first command it polls with `reply`. */
+async function pairAndAnswer(context, reply) {
+  const pairingCode = (await context.credentials.readRecord(PAIRING_KEY)).key
+  const { pairToken } = await call(context, 'authorize', { pairingCode })
+  const { sessionToken } = await call(context, 'connect', { pairToken })
+  return async () => {
+    const { commands } = await call(context, 'poll', { sessionToken })
+    const [command] = commands
+    await call(context, 'respond', { sessionToken, id: command.id, ok: true, result: reply(command) })
+    return command
+  }
+}
+
+describe('dsh_browser_download action save', () => {
+  let root
+  let context
+  const exec = () => ({ agent: { session: { header: { cwd: root } } }, signal: new AbortController().signal })
+
+  beforeEach(async () => {
+    root = await realpath(await mkdtemp(join(tmpdir(), 'dsh-chrome-save-')))
+  })
+
+  afterEach(async () => {
+    for (const dispose of context?.disposers ?? []) await dispose?.()
+    await rm(root, { recursive: true, force: true })
+  })
+
+  it('fetches through the tab and writes the bytes into the workspace', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const pdf = Buffer.from('%PDF-1.7 invoice')
+    const answer = await pairAndAnswer(context, () => ({
+      tabId: 7, frameId: 0, via: 'page', finalUrl: 'https://shop.test/inv?id=1', status: 200,
+      contentType: 'application/pdf', contentDisposition: 'attachment; filename="Invoice-1.pdf"',
+      bytes: pdf.length, base64: pdf.toString('base64'),
+    }))
+    const tool = context.registered.get('dsh_browser_download')
+    const pending = tool.execute({ action: 'save', tabId: 7, url: 'https://shop.test/inv?id=1', directory: 'invoices' }, exec())
+    const command = await answer()
+    assert.equal(command.method, 'page.fetchFile')
+    assert.deepEqual(command.params, { tabId: 7, url: 'https://shop.test/inv?id=1' })
+    const result = await pending
+    assert.equal(result.saved, true)
+    assert.equal(result.relativePath, 'invoices/Invoice-1.pdf')
+    assert.equal(result.finalOrigin, 'https://shop.test')
+    assert.equal(result.base64, undefined)
+    assert.deepEqual(await readFile(join(root, 'invoices', 'Invoice-1.pdf')), pdf)
+  })
+
+  it('refuses to save under a read-only session file policy', async () => {
+    context = fakePluginContext({ root, mode: 'read-only' })
+    await apply(context)
+    await pairAndAnswer(context, () => ({}))
+    const tool = context.registered.get('dsh_browser_download')
+    await assert.rejects(tool.execute({ action: 'save', tabId: 7, url: 'https://shop.test/a.pdf' }, exec()), /read-only/u)
+  })
+
+  it('requires a tab for save', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const tool = context.registered.get('dsh_browser_download')
+    await assert.rejects(tool.execute({ action: 'save', url: 'https://shop.test/a.pdf' }, exec()), /tabId is required/u)
+  })
+})
