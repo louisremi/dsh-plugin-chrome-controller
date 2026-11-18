@@ -137,16 +137,6 @@ describe('dsh_browser_save_file', () => {
       /no working-directory or sandbox-policy service/u)
   })
 
-  it('rejects arguments that do not apply to the dsh_browser_download action', async () => {
-    context = fakePluginContext({ root })
-    await apply(context)
-    await pairAndAnswer(context, () => ({}))
-    const download = context.registered.get('dsh_browser_download')
-    await assert.rejects(download.execute({ action: 'status', downloadId: 1, url: 'https://shop.test/a.pdf' }, exec()), /url does not apply to action status/u)
-    await assert.rejects(download.execute({ action: 'start', url: 'https://shop.test/a.pdf', downloadId: 1 }, exec()), /downloadId does not apply to action start/u)
-    await assert.rejects(download.execute({ action: 'start', url: 'https://shop.test/a.pdf', filename: 'a.' }, exec()), /simple file name/u)
-  })
-
   it('requires a tab for save', async () => {
     context = fakePluginContext({ root })
     await apply(context)

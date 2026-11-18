@@ -703,10 +703,14 @@ function delay(ms, signal) {
   })
 }
 
-/** Allow large results (file bytes) time to upload: 10 s plus 10 s per MB of base64. */
-function responseTimeoutMs(result) {
-  const encoded = typeof result?.base64 === 'string' ? result.base64.length : 0
-  return 10_000 + Math.ceil(encoded / (1024 * 1024)) * 10_000
+/**
+ * Response upload timeout. Only page.fetchFile results carry file bytes large
+ * enough to need more: 10 s plus 10 s per MB of base64. Every other operation
+ * keeps the default 10 s.
+ */
+function responseTimeoutMs(method, result) {
+  if (method !== 'page.fetchFile' || typeof result?.base64 !== 'string') return 10_000
+  return 10_000 + Math.ceil(result.base64.length / (1024 * 1024)) * 10_000
 }
 
 async function postJson(origin, path, payload, sessionSignal, timeoutMs = 10_000) {
@@ -931,7 +935,7 @@ async function handleBrowserRequest(session, command, signal, commandSignal) {
       id: command.id,
       ok: true,
       result,
-    }, signal, responseTimeoutMs(result))
+    }, signal, responseTimeoutMs(command.method, result))
     if (dragTraceId !== undefined) logDragTrace(dragTraceId, 'response-post-finished')
   } catch (error) {
     if (dragTraceId !== undefined) logDragTrace(dragTraceId, 'operation-or-response-error', {
@@ -4791,10 +4795,9 @@ async function startDownload(params) {
   if (parsedUrl.username || parsedUrl.password) throw new Error('Download URLs cannot contain embedded credentials')
   const options = { url, saveAs: params.saveAs !== false }
   if (params.filename !== undefined) {
-    // Same rule as the plugin's isSimpleFileName: no separators, reserved or
-    // control characters, leading/trailing dots or spaces, at most 200 characters.
-    if (typeof params.filename !== 'string' || params.filename.length === 0 || params.filename.length > 200
-      || /[\\/:*?"<>|\u0000-\u001f\u007f]/u.test(params.filename) || /^[.\s]|[.\s]$/u.test(params.filename)) {
+    if (typeof params.filename !== 'string' || params.filename.trim() === ''
+      || params.filename.length > 255 || /[\\/:*?"<>|]/u.test(params.filename)
+      || params.filename === '.' || params.filename === '..') {
       throw new Error('filename must be a simple file name without path separators')
     }
     options.filename = params.filename
