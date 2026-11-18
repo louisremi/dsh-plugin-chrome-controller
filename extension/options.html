@@ -20,7 +20,7 @@
 
       <form id="connection-form" novalidate>
         <h2>DSH Web connection</h2>
-        <p>For first setup, open DSH Web yourself and choose Settings, then Chrome browser. Copy the pairing code shown there. The direct page is <code id="pairing-page-url"></code>. Connect and automatic reconnection do not open a DSH tab.</p>
+        <p>For first setup, open DSH Web yourself and choose Settings, then Chrome browser. Copy the DSH Web origin and pairing code shown there. The origin can be a loopback address such as <code>http://127.0.0.1:3080</code>, or an HTTPS address for a remote DSH Web. The direct page is <code id="pairing-page-url"></code>. Connect and automatic reconnection do not open a DSH tab.</p>
         <label for="dsh-origin">DSH Web origin</label>
         <input id="dsh-origin" name="dsh-origin" type="url" inputmode="url" placeholder="http://127.0.0.1:3080" spellcheck="false" autocomplete="off">
         <label for="dsh-pairing-code">Pairing code</label>

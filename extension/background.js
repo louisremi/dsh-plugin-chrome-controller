@@ -951,13 +951,18 @@ function logDragTrace(id, event, details = {}) {
   }))
 }
 
-/** Normalize a user-supplied DSH Web origin; only loopback HTTP(S) is allowed. */
+/**
+ * Normalize a user-supplied DSH Web origin. Loopback hosts may use HTTP or
+ * HTTPS; any other host must use HTTPS so the pairing code and session tokens
+ * never cross the network in clear text.
+ */
 function normalizeDshOrigin(value) {
   if (typeof value !== 'string' || value.trim() === '') return undefined
   try {
     const url = new URL(value.trim())
     if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-    if (url.hostname !== '127.0.0.1' && url.hostname !== 'localhost' && url.hostname !== '[::1]') return undefined
+    const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
+    if (!loopback && url.protocol !== 'https:') return undefined
     return url.origin
   } catch {
     return undefined
@@ -972,7 +977,7 @@ async function readConnectionSettings() {
   const stored = await chrome.storage.local.get(CONNECTION_SETTINGS_KEY)
   const settings = stored?.[CONNECTION_SETTINGS_KEY]
   const origin = settings?.origin === undefined ? DEFAULT_DSH_ORIGIN : normalizeDshOrigin(settings.origin)
-  if (origin === undefined) throw new Error('Set a valid local DSH Web address in Settings')
+  if (origin === undefined) throw new Error('Set a loopback or HTTPS DSH Web address in Settings')
   return {
     origin,
     pairingCode: typeof settings?.pairingCode === 'string' ? settings.pairingCode.trim() : '',

@@ -5,6 +5,9 @@
   "description": "Use a paired Chrome extension as DeepSeek Harness browser tools",
   "type": "module",
   "main": "lib/index.js",
+  "scripts": {
+    "test": "node --test"
+  },
   "exports": {
     ".": {
       "default": "./lib/index.js"

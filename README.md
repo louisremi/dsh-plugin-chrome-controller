@@ -1,14 +1,13 @@
 # dsh-plugin-chrome-controller
 
-Use a Chrome extension to give DeepSeek Harness browser tools for the Chrome window you are already using. The extension pairs with a local DSH Web instance and controls tabs through Chrome's debugger API.
+Use a Chrome extension to give DeepSeek Harness browser tools for the Chrome window you are already using. The extension pairs with a DSH Web instance, local or remote, and controls tabs through Chrome's debugger API.
 
 ## Requirements
 
-- DeepSeek Harness Web on the same computer as Chrome.
+- DeepSeek Harness Web, reachable from Chrome either at a loopback URL such as `http://127.0.0.1:3080`, or over HTTPS at an address DSH Web trusts (see [Remote DSH Web](#remote-dsh-web)). Open it once to copy the origin and pairing code during setup.
 - Chrome 116 or later.
-- DSH Web bound to `127.0.0.1` at a local URL such as `http://127.0.0.1:3080`. Open it once to copy the pairing code during setup.
 
-The plugin refuses to start if DSH Web is not bound to `127.0.0.1`. The first version supports DSH Web. Headless and CLI profiles do not provide the authenticated browser pairing route. The default Web profile includes the credential store; custom compositions must provide one. The linked package has no extra runtime package dependencies to install.
+The first version supports DSH Web. Headless and CLI profiles do not provide the authenticated browser pairing route. The default Web profile includes the credential store; custom compositions must provide one. The linked package has no extra runtime package dependencies to install.
 
 ## Install the DSH plugin
 
@@ -25,7 +24,7 @@ Restart DSH Web and reload its page after installation or an update.
 1. Open `chrome://extensions`.
 2. Turn on Developer mode.
 3. Select **Load unpacked** and choose this package's `extension` folder. Approve HTTP and HTTPS site access when Chrome asks.
-4. Open DSH Web yourself in an authenticated browser. Choose **Settings**, then **Chrome browser**, and copy the pairing code. The direct page is `http://127.0.0.1:3080/api/dsh-browser-extension/pairing` (use your DSH Web origin if the port differs).
+4. Open DSH Web yourself in an authenticated browser. Choose **Settings**, then **Chrome browser**, and copy the DSH Web origin and pairing code. The direct page is `http://127.0.0.1:3080/api/dsh-browser-extension/pairing` (use your DSH Web origin if it differs).
 5. Open the extension popup, choose **Settings**, enter the DSH Web origin and pairing code, and save.
 6. Click **Connect to DSH Web** in the popup. Connecting does not open a DSH tab.
 
@@ -35,9 +34,19 @@ The extension requests access to HTTP and HTTPS websites so it can inject the vi
 
 Open the extension popup and select **Settings** to customize typing delays and key holds, longer pauses, cursor speed and arc, drag duration, and the delay between sequence steps. Each setting has a description and allowed range. The defaults are the project's tested baseline. Changing them may cause sites to flag or restrict activity; no settings guarantee a site will accept interactions.
 
-The extension Settings page has a **DSH Web connection** section for the local origin, saved pairing code, and automatic connection toggle. The code field stays blank after saving; leave it blank to keep the saved code, or paste a new code after rotation. The page shows the DSH pairing page address for the current origin. The popup's **Connect** button uses these saved settings without opening a DSH tab.
+The extension Settings page has a **DSH Web connection** section for the DSH Web origin, saved pairing code, and automatic connection toggle. The code field stays blank after saving; leave it blank to keep the saved code, or paste a new code after rotation. The page shows the DSH pairing page address for the current origin. The popup's **Connect** button uses these saved settings without opening a DSH tab.
 
 Once paired, the extension keeps its Manifest V3 service worker alive on its own: a 30-second heartbeat alarm wakes the worker if Chrome suspends it, and a 25-second `chrome.runtime.getPlatformInfo()` call resets the worker's idle timer while it runs. Browser tools therefore respond without opening the extension popup. After updating the extension, reload it on `chrome://extensions` and click **Connect** again. The saved pairing code remains in extension Settings; copy a new one if it was rotated. Reload any page that had an element watcher running before the update.
+
+## Remote DSH Web
+
+DSH Web does not have to run on the same computer as Chrome. For example, it can run in a container or on a NAS behind a reverse proxy or a tailnet name such as `https://dsh.example.ts.net`. Requirements:
+
+- **HTTPS.** The extension accepts plain HTTP only for loopback addresses (`127.0.0.1`, `localhost`, `[::1]`), so the pairing code and session tokens never travel unencrypted.
+- **A trusted authority.** The extension routes accept a request when its `Host` is loopback on a loopback connection, or when DSH Web's own `/api` Host fence accepts it: the listener's bind address or an authority passed with `dsh --profile web --trusted-host <host>` (the `connection` row's `trustedHosts`). If the DSH Web UI works at that address, the extension routes do too.
+- **The proxy forwards the original `Host` header**, as it must for DSH Web itself.
+
+Enter the HTTPS origin shown in DSH **Settings → Chrome browser** in the extension Settings. The extension routes do not use the DSH Web login cookie; the pairing code authenticates them. After 10 wrong pairing codes within a minute, every pairing attempt is refused until the minute has passed. Only expose DSH Web on networks you trust, as for DSH Web itself.
 
 ## Browser tools
 
