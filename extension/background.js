@@ -118,6 +118,8 @@ const MAX_NETWORK_COOKIES = 500
 const MAX_CONSOLE_ENTRIES = 200
 const MAX_EXTRACT_ITEMS = 100
 const MAX_EXTRACT_CHARS = 50_000
+// Base64 inflates by 4/3, so 10 MB stays below the DSH bridge's 20 MB body limit.
+const MAX_FETCH_FILE_BYTES = 10 * 1024 * 1024
 
 let activeSession
 let pollController
@@ -1377,6 +1379,8 @@ async function executeBrowserOperationNow(method, params, signal) {
         return { tabId, selector, selectedCount: Array.isArray(files) ? files.length : 0, files }
       })
     }
+    case 'page.fetchFile':
+      return fetchFileInTab(params)
     case 'downloads.start':
       return startDownload(params)
     case 'downloads.status':
@@ -4704,6 +4708,63 @@ function extractPage(params) {
     if (!isRecord(result)) throw new Error('Chrome returned no structured extraction result')
     return { tabId, ...result }
   })
+}
+
+/**
+ * Fetch one URL from inside a tab frame so the request carries that page's
+ * cookies, origin, and network path, and return the bytes as base64. When the
+ * page cannot read the response (a cross-origin URL without CORS), retry from
+ * the service worker, whose host permissions allow the read.
+ */
+async function fetchFileInTab(params) {
+  const tabId = requireTabId(params.tabId)
+  const frameId = params.frameId === undefined ? 0 : requireFrameId(params.frameId)
+  const url = httpUrl(params.url)
+  const parsedUrl = new URL(url)
+  if (parsedUrl.username || parsedUrl.password) throw new Error('Download URLs cannot contain embedded credentials')
+  let payload = await runInFrame(tabId, frameId, frameFetchFilePayload, [url, MAX_FETCH_FILE_BYTES])
+  if (isRecord(payload) && payload.unreadable === true) {
+    payload = await frameFetchFilePayload(url, MAX_FETCH_FILE_BYTES)
+    if (isRecord(payload)) payload.via = 'extension'
+  }
+  if (!isRecord(payload)) throw new Error('The tab returned no download result')
+  if (typeof payload.error === 'string') throw new Error(payload.error)
+  return { tabId, frameId, ...payload }
+}
+
+/** Runs in the tab frame (and as a service-worker fallback): fetch one URL and encode its body. */
+async function frameFetchFilePayload(url, maxBytes) {
+  let response
+  try {
+    response = await fetch(url, { credentials: 'include', cache: 'no-store', redirect: 'follow' })
+  } catch (error) {
+    // A TypeError here is a CORS or network refusal the caller may retry elsewhere.
+    return { unreadable: true, error: 'The page could not fetch the URL: ' + String(error?.message ?? error) }
+  }
+  if (response.type === 'opaque' || response.type === 'opaqueredirect') {
+    return { unreadable: true, error: 'The response is not readable from the page' }
+  }
+  if (!response.ok) return { error: 'The download request failed with HTTP status ' + String(response.status) }
+  const declared = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { error: 'The file is larger than the ' + String(maxBytes) + '-byte limit' }
+  }
+  const blob = await response.blob()
+  if (blob.size > maxBytes) return { error: 'The file is larger than the ' + String(maxBytes) + '-byte limit' }
+  const bytes = new Uint8Array(await blob.arrayBuffer())
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000))
+  }
+  return {
+    via: 'page',
+    finalUrl: response.url || url,
+    status: response.status,
+    contentType: response.headers.get('content-type') ?? '',
+    contentDisposition: response.headers.get('content-disposition') ?? '',
+    bytes: bytes.length,
+    base64: btoa(binary),
+  }
 }
 
 async function startDownload(params) {
