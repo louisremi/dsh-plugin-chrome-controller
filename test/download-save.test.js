@@ -72,7 +72,7 @@ async function pairAndAnswer(context, reply) {
   }
 }
 
-describe('dsh_browser_download action save', () => {
+describe('dsh_browser_save_file', () => {
   let root
   let context
   const exec = () => ({ agent: { session: { header: { cwd: root } } }, signal: new AbortController().signal })
@@ -95,8 +95,8 @@ describe('dsh_browser_download action save', () => {
       contentType: 'application/pdf', contentDisposition: 'attachment; filename="Invoice-1.pdf"',
       bytes: pdf.length, base64: pdf.toString('base64'),
     }))
-    const tool = context.registered.get('dsh_browser_download')
-    const pending = tool.execute({ action: 'save', tabId: 7, url: 'https://shop.test/inv?id=1', directory: 'invoices' }, exec())
+    const tool = context.registered.get('dsh_browser_save_file')
+    const pending = tool.execute({ tabId: 7, url: 'https://shop.test/inv?id=1', directory: 'invoices' }, exec())
     const command = await answer()
     assert.equal(command.method, 'page.fetchFile')
     assert.deepEqual(command.params, { tabId: 7, url: 'https://shop.test/inv?id=1' })
@@ -108,18 +108,30 @@ describe('dsh_browser_download action save', () => {
     assert.deepEqual(await readFile(join(root, 'invoices', 'Invoice-1.pdf')), pdf)
   })
 
+  it('saves into .tmp/downloads by default and leaves dsh_browser_download unchanged', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const answer = await pairAndAnswer(context, () => ({ via: 'page', finalUrl: 'https://shop.test/a.pdf', contentType: 'application/pdf', bytes: 1, base64: 'eA==' }))
+    const pending = context.registered.get('dsh_browser_save_file').execute({ tabId: 7, url: 'https://shop.test/a.pdf' }, exec())
+    await answer()
+    assert.equal((await pending).relativePath, '.tmp/downloads/a.pdf')
+    const download = context.registered.get('dsh_browser_download')
+    assert.deepEqual(download.parameters.properties.action.enum, ['start', 'status', 'cancel'])
+    await assert.rejects(download.execute({ action: 'save', url: 'https://shop.test/a.pdf' }, exec()), /Invalid value for browser argument: action/u)
+  })
+
   it('refuses to save under a read-only session file policy', async () => {
     context = fakePluginContext({ root, mode: 'read-only' })
     await apply(context)
     await pairAndAnswer(context, () => ({}))
-    const tool = context.registered.get('dsh_browser_download')
-    await assert.rejects(tool.execute({ action: 'save', tabId: 7, url: 'https://shop.test/a.pdf' }, exec()), /read-only/u)
+    const tool = context.registered.get('dsh_browser_save_file')
+    await assert.rejects(tool.execute({ tabId: 7, url: 'https://shop.test/a.pdf' }, exec()), /read-only/u)
   })
 
   it('requires a tab for save', async () => {
     context = fakePluginContext({ root })
     await apply(context)
-    const tool = context.registered.get('dsh_browser_download')
-    await assert.rejects(tool.execute({ action: 'save', url: 'https://shop.test/a.pdf' }, exec()), /tabId is required/u)
+    const tool = context.registered.get('dsh_browser_save_file')
+    await assert.rejects(tool.execute({ url: 'https://shop.test/a.pdf' }, exec()), /Missing browser argument: tabId/u)
   })
 })
