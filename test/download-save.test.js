@@ -26,7 +26,7 @@ function fakePluginContext({ mode = 'workspace-write', root, withServices = true
     skills: { register() {} },
     systemPrompt: { section() {}, getSectionOrder: () => 0 },
     tools: { register(tool) { tools.set(tool.name, tool) } },
-    webServer: { register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path) } },
+    webServer: { host: '127.0.0.1', register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path) } },
     connection: { fetch: { register: () => () => {} }, requestRejection: () => 401 },
     credentials: {
       async readRecord(key) { return records.get(key) },
