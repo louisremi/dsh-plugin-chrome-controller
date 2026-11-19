@@ -1,3 +1,5 @@
+import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
 const CONNECT_PATH = '/dsh-browser-extension/connect'
 const POLL_PATH = '/dsh-browser-extension/poll'
@@ -7,7 +9,6 @@ const SESSION_KEY = 'dshBrowserSession'
 const BEHAVIOR_SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
-const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 const RECONNECT_ALARM = 'dsh-browser-reconnect'
 const RECONNECT_ALARM_PERIOD_MINUTES = 0.5
 const RECONNECT_WANTED_KEY = 'dshBrowserReconnectWanted'
@@ -961,24 +962,6 @@ function logDragTrace(id, event, details = {}) {
     method: details.method,
     error: details.error,
   }))
-}
-
-/**
- * Normalize a user-supplied DSH Web origin. Loopback hosts may use HTTP or
- * HTTPS; any other host must use HTTPS so the pairing code and session tokens
- * never cross the network in clear text.
- */
-function normalizeDshOrigin(value) {
-  if (typeof value !== 'string' || value.trim() === '') return undefined
-  try {
-    const url = new URL(value.trim())
-    if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-    const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
-    if (!loopback && url.protocol !== 'https:') return undefined
-    return url.origin
-  } catch {
-    return undefined
-  }
 }
 
 /** Read the configured origin and the persistent code supplied by the user. */

@@ -1,6 +1,7 @@
+import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+
 const SETTINGS_KEY = 'dshBrowserBehaviorSettings'
 const CONNECTION_SETTINGS_KEY = 'dshBrowserConnectionSettings'
-const DEFAULT_DSH_ORIGIN = 'http://127.0.0.1:3080'
 const PAIRING_SETTINGS_PATH = '/api/dsh-browser-extension/pairing'
 const PAIRING_CODE_PATTERN = /^[A-Za-z0-9_-]{24}$/u
 
@@ -182,20 +183,10 @@ async function initialize() {
   updatePairingPage()
 }
 
-/** Accept loopback HTTP(S) or remote HTTPS origins; empty resets to the default. */
+/** Normalize the origin field; empty resets to the default. */
 function readOrigin() {
   const raw = originInput.value.trim()
-  if (raw === '') return DEFAULT_DSH_ORIGIN
-  let url
-  try {
-    url = new URL(raw)
-  } catch {
-    return undefined
-  }
-  if (url.protocol !== 'http:' && url.protocol !== 'https:') return undefined
-  const loopback = url.hostname === '127.0.0.1' || url.hostname === 'localhost' || url.hostname === '[::1]'
-  if (!loopback && url.protocol !== 'https:') return undefined
-  return url.origin
+  return raw === '' ? DEFAULT_DSH_ORIGIN : normalizeDshOrigin(raw)
 }
 
 function updatePairingPage() {
