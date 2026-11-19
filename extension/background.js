@@ -114,6 +114,8 @@ const MAX_NETWORK_COOKIES = 500
 const MAX_CONSOLE_ENTRIES = 200
 const MAX_EXTRACT_ITEMS = 100
 const MAX_EXTRACT_CHARS = 50_000
+// Base64 inflates by 4/3, so 10 MB stays below the DSH bridge's 20 MB body limit.
+const MAX_FETCH_FILE_BYTES = 10 * 1024 * 1024
 
 let activeSession
 let pollController
@@ -697,6 +699,16 @@ function delay(ms, signal) {
   })
 }
 
+/**
+ * Response upload timeout. Only page.fetchFile results carry file bytes large
+ * enough to need more: 10 s plus 10 s per MB of base64. Every other operation
+ * keeps the default 10 s.
+ */
+function responseTimeoutMs(method, result) {
+  if (method !== 'page.fetchFile' || typeof result?.base64 !== 'string') return 10_000
+  return 10_000 + Math.ceil(result.base64.length / (1024 * 1024)) * 10_000
+}
+
 async function postJson(origin, path, payload, sessionSignal, timeoutMs = 10_000) {
   const controller = new AbortController()
   const abortFromSession = () => controller.abort(sessionSignal.reason)
@@ -919,7 +931,7 @@ async function handleBrowserRequest(session, command, signal, commandSignal) {
       id: command.id,
       ok: true,
       result,
-    }, signal)
+    }, signal, responseTimeoutMs(command.method, result))
     if (dragTraceId !== undefined) logDragTrace(dragTraceId, 'response-post-finished')
   } catch (error) {
     if (dragTraceId !== undefined) logDragTrace(dragTraceId, 'operation-or-response-error', {
@@ -1387,6 +1399,8 @@ async function executeBrowserOperationNow(method, params, signal) {
         return { tabId, selector, selectedCount: Array.isArray(files) ? files.length : 0, files }
       })
     }
+    case 'page.fetchFile':
+      return fetchFileWithTabSession(params)
     case 'downloads.start':
       return startDownload(params)
     case 'downloads.status':
@@ -3965,6 +3979,75 @@ function extractPage(params) {
     if (!isRecord(result)) throw new Error('Chrome returned no structured extraction result')
     return { tabId, ...result }
   })
+}
+
+/**
+ * Fetch one URL with a tab frame's session and return the bytes as base64.
+ * The request runs inside the frame so it carries that page's cookies, origin,
+ * and network path. Only when the page received a response it may not read
+ * (a cross-origin URL without CORS) does the service worker retry, using its
+ * host permissions and the browser's cookies for that site.
+ */
+async function fetchFileWithTabSession(params) {
+  const tabId = requireTabId(params.tabId)
+  const frameId = params.frameId === undefined ? 0 : requireFrameId(params.frameId)
+  const url = httpUrl(params.url)
+  const parsedUrl = new URL(url)
+  if (parsedUrl.username || parsedUrl.password) throw new Error('Download URLs cannot contain embedded credentials')
+  let payload = await runInFrame(tabId, frameId, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
+  if (isRecord(payload) && payload.blockedByCors === true) {
+    payload = await fetchFileAsBase64(url, MAX_FETCH_FILE_BYTES, 'extension')
+  }
+  if (!isRecord(payload)) throw new Error('The tab returned no download result')
+  if (typeof payload.error === 'string') throw new Error(payload.error)
+  return { tabId, frameId, ...payload }
+}
+
+/**
+ * Fetch one URL and encode its body. Self-contained: it runs inside the tab
+ * frame (via) 'page', and in the service worker as via 'extension'.
+ * A page fetch that fails before any response is retried without CORS only
+ * when a no-cors probe shows the server answered, so plain network failures
+ * are reported instead of retried.
+ */
+async function fetchFileAsBase64(url, maxBytes, via) {
+  const requester = via === 'page' ? 'The page' : 'The extension'
+  let response
+  try {
+    response = await fetch(url, { credentials: 'include', cache: 'no-store', redirect: 'follow' })
+  } catch (error) {
+    if (via === 'page') {
+      try {
+        await fetch(url, { mode: 'no-cors', credentials: 'include', cache: 'no-store', redirect: 'follow' })
+        return { blockedByCors: true }
+      } catch {}
+    }
+    return { error: requester + ' could not fetch the URL: ' + String(error?.message ?? error) }
+  }
+  if (response.type === 'opaque' || response.type === 'opaqueredirect') {
+    return via === 'page' ? { blockedByCors: true } : { error: requester + ' cannot read the response' }
+  }
+  if (!response.ok) return { error: requester + ' request failed with HTTP status ' + String(response.status) }
+  const declared = Number(response.headers.get('content-length'))
+  if (Number.isFinite(declared) && declared > maxBytes) {
+    return { error: 'The file is larger than the ' + String(maxBytes) + '-byte limit' }
+  }
+  const blob = await response.blob()
+  if (blob.size > maxBytes) return { error: 'The file is larger than the ' + String(maxBytes) + '-byte limit' }
+  const bytes = new Uint8Array(await blob.arrayBuffer())
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000))
+  }
+  return {
+    via,
+    finalUrl: response.url || url,
+    status: response.status,
+    contentType: response.headers.get('content-type') ?? '',
+    contentDisposition: response.headers.get('content-disposition') ?? '',
+    bytes: bytes.length,
+    base64: btoa(binary),
+  }
 }
 
 async function startDownload(params) {
