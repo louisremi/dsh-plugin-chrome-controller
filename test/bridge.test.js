@@ -148,6 +148,16 @@ describe('BrowserExtensionBridge authority admission', () => {
     assert.equal((await call(context, 'authorize', { method: 'OPTIONS' })).status, 403)
   })
 
+  it('fails closed on an unexpected fence status', async () => {
+    for (const status of [400, 429, 500]) {
+      const context = fakeContext({ rejection: () => status })
+      const local = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+      const result = await call(context, 'authorize', { method: 'OPTIONS' })
+      await local.close()
+      assert.equal(result.status, 403, `status ${status}`)
+    }
+  })
+
   it('starts when DSH Web binds an address other than 127.0.0.1', async () => {
     const context = fakeContext({ bindHost: '172.19.0.4' })
     bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
@@ -204,5 +214,17 @@ describe('pairing settings page', () => {
     } finally {
       await bridge.close()
     }
+  })
+})
+
+describe('extension origin rule', () => {
+  it('allows loopback over HTTP or HTTPS and remote hosts only over HTTPS', async () => {
+    const { normalizeDshOrigin } = await import('../extension/origin.js')
+    assert.equal(normalizeDshOrigin('http://127.0.0.1:3080/x'), 'http://127.0.0.1:3080')
+    assert.equal(normalizeDshOrigin('https://localhost:3080'), 'https://localhost:3080')
+    assert.equal(normalizeDshOrigin('https://dsh.example.com'), 'https://dsh.example.com')
+    assert.equal(normalizeDshOrigin('http://dsh.example.com'), undefined)
+    assert.equal(normalizeDshOrigin('ftp://127.0.0.1'), undefined)
+    assert.equal(normalizeDshOrigin(''), undefined)
   })
 })
