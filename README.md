@@ -46,7 +46,7 @@ DSH Web does not have to run on the same computer as Chrome. For example, it can
 - **A trusted authority.** The extension routes accept a request when its `Host` is loopback on a loopback connection, or when DSH Web's own `/api` Host fence accepts it: the listener's bind address or an authority passed with `dsh --profile web --trusted-host <host>` (the `connection` row's `trustedHosts`). If the DSH Web UI works at that address, the extension routes do too.
 - **The proxy forwards the original `Host` header**, as it must for DSH Web itself.
 
-Enter the HTTPS origin shown in DSH **Settings → Chrome browser** in the extension Settings. The extension routes do not use the DSH Web login cookie; the pairing code authenticates them. After 10 wrong pairing codes within a minute, every pairing attempt is refused until the minute has passed. Only expose DSH Web on networks you trust, as for DSH Web itself.
+Enter the HTTPS origin shown in DSH **Settings → Chrome browser** in the extension Settings. The extension routes do not use the DSH Web login cookie; the pairing code authenticates them. After 10 wrong pairing codes within a minute, every pairing attempt is refused with a "wait a minute" message (HTTP 429) until the minute has passed; the extension shows that message in its popup and Settings. The counter is global, because behind a proxy every peer looks local, so anyone who can reach a trusted address can also hold the limit open and block pairing. Only expose DSH Web on networks you trust, as for DSH Web itself.
 
 ## Browser tools
 

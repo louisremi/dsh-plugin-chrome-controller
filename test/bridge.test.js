@@ -12,6 +12,7 @@ function fakeContext({ bindHost = '127.0.0.1', rejection } = {}) {
   const routes = new Map()
   const fetchRoutes = new Map()
   const records = new Map()
+  const handlers = new Map()
   const context = {
     routes,
     fetchRoutes,
@@ -43,7 +44,11 @@ function fakeContext({ bindHost = '127.0.0.1', rejection } = {}) {
         return records.get(key)
       },
     },
-    on: () => () => {},
+    handlers,
+    on(event, handler) {
+      handlers.set(event, [...(handlers.get(event) ?? []), handler])
+      return () => handlers.delete(event)
+    },
     effect: () => {},
   }
   return context
@@ -142,6 +147,41 @@ describe('BrowserExtensionBridge authority admission', () => {
     assert.equal(denied.status, 403)
   })
 
+  it('lets the webserver/authorize hook admit only trusted extension requests', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const [hook] = context.handlers.get('webserver/authorize')
+    const request = ({ host = TRUSTED_HOST, origin = EXTENSION_ORIGIN, method = 'POST', pathname = '/dsh-browser-extension/connect', remoteAddress = '100.64.0.7' } = {}) => ({
+      transport: 'http', method, url: { pathname }, headers: { host, origin }, socket: { remoteAddress },
+    })
+    assert.deepEqual(hook(request(), 'anonymous'), { kind: 'allow' })
+    assert.deepEqual(hook(request({ method: 'OPTIONS' }), 'anonymous'), { kind: 'allow' })
+    assert.deepEqual(hook(request({ host: '127.0.0.1:3080', remoteAddress: '127.0.0.1' }), 'anonymous'), { kind: 'allow' })
+    assert.equal(hook(request({ host: 'evil.example' }), 'anonymous'), undefined)
+    assert.equal(hook(request({ origin: 'https://evil.example' }), 'anonymous'), undefined)
+    assert.equal(hook(request({ pathname: '/api/other' }), 'anonymous'), undefined)
+    assert.equal(hook(request({ method: 'GET' }), 'anonymous'), undefined)
+    assert.equal(hook(request(), 'session'), undefined)
+    await bridge.close()
+    assert.equal(hook(request(), 'anonymous'), undefined)
+  })
+
+  it('preflights, admits and rejects on every extension route', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    const sessionToken = await connect(context)
+    for (const path of ['authorize', 'connect', 'poll', 'respond', 'disconnect']) {
+      assert.equal((await call(context, path, { method: 'OPTIONS' })).status, 204, path + ' preflight')
+      assert.equal((await call(context, path, { method: 'OPTIONS', host: 'evil.example' })).status, 403, path + ' untrusted preflight')
+      assert.equal((await call(context, path, { host: 'evil.example', body: {} })).status, 403, path + ' untrusted host')
+      assert.equal((await call(context, path, { origin: 'https://evil.example', body: {} })).status, 403, path + ' web origin')
+      assert.equal((await call(context, path, { method: 'GET' })).status, 405, path + ' method')
+    }
+    const disconnected = await call(context, 'disconnect', { body: { sessionToken } })
+    assert.equal(disconnected.status, 200)
+    assert.equal((await call(context, 'poll', { body: { sessionToken } })).status, 401)
+  })
+
   it('fails closed when the Host fence throws', async () => {
     const context = fakeContext({ rejection: () => { throw new Error('boom') } })
     bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
@@ -181,7 +221,9 @@ describe('BrowserExtensionBridge pairing failure limit', () => {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       assert.equal((await call(context, 'authorize', wrong)).status, 401)
     }
-    assert.equal((await call(context, 'authorize', wrong)).status, 429)
+    const limited = await call(context, 'authorize', wrong)
+    assert.equal(limited.status, 429)
+    assert.match(limited.json.error, /wait a minute/u)
     const code = await pairingCode(context)
     assert.equal((await call(context, 'authorize', { body: { pairingCode: code } })).status, 429)
     mock.timers.tick(60_001)
@@ -214,6 +256,28 @@ describe('pairing settings page', () => {
     } finally {
       await bridge.close()
     }
+  })
+})
+
+describe('pairing page HTTPS hint', () => {
+  async function pageFor(headers) {
+    const context = fakeContext()
+    const bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
+    try {
+      const page = await context.fetchRoutes.get('/api/dsh-browser-extension/pairing')(new Request('http://x/api/dsh-browser-extension/pairing', { headers }))
+      return await page.text()
+    } finally {
+      await bridge.close()
+    }
+  }
+
+  it('warns when the shown remote origin is plain HTTP', async () => {
+    assert.match(await pageFor({ host: TRUSTED_HOST }), /enter the <code>https:\/\/<\/code> form/u)
+  })
+
+  it('stays quiet for HTTPS remote origins and loopback origins', async () => {
+    assert.doesNotMatch(await pageFor({ host: TRUSTED_HOST, 'x-forwarded-proto': 'https' }), /form of this address/u)
+    assert.doesNotMatch(await pageFor({ host: '127.0.0.1:3080' }), /form of this address/u)
   })
 })
 
