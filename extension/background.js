@@ -120,6 +120,11 @@ const MAX_EXTRACT_ITEMS = 100
 const MAX_EXTRACT_CHARS = 50_000
 // Base64 inflates by 4/3, so 10 MB stays below the DSH bridge's 20 MB body limit.
 const MAX_FETCH_FILE_BYTES = 10 * 1024 * 1024
+// A credentialed service-worker retry must be approved by the user in DSH
+// within this window, and each token is good for one fetch of one URL.
+const FETCH_RETRY_TOKEN_TTL_MS = 5 * 60_000
+const MAX_FETCH_RETRY_TOKENS = 20
+const fetchRetryTokens = new Map()
 
 let activeSession
 let pollController
@@ -704,12 +709,12 @@ function delay(ms, signal) {
 }
 
 /**
- * Response upload timeout. Only page.fetchFile results carry file bytes large
+ * Response upload timeout. Only page.fetchFile and page.fetchFileRetry results carry file bytes large
  * enough to need more: 10 s plus 10 s per MB of base64. Every other operation
  * keeps the default 10 s.
  */
 function responseTimeoutMs(method, result) {
-  if (method !== 'page.fetchFile' || typeof result?.base64 !== 'string') return 10_000
+  if ((method !== 'page.fetchFile' && method !== 'page.fetchFileRetry') || typeof result?.base64 !== 'string') return 10_000
   return 10_000 + Math.ceil(result.base64.length / (1024 * 1024)) * 10_000
 }
 
@@ -1391,6 +1396,8 @@ async function executeBrowserOperationNow(method, params, signal) {
     }
     case 'page.fetchFile':
       return fetchFileWithTabSession(params)
+    case 'page.fetchFileRetry':
+      return fetchFileApprovedRetry(params)
     case 'downloads.start':
       return startDownload(params)
     case 'downloads.status':
@@ -4723,37 +4730,113 @@ function extractPage(params) {
 /**
  * Fetch one URL with a tab frame's session and return the bytes as base64.
  * The request runs inside the frame so it carries that page's cookies, origin,
- * and network path. Only when the page received a response it may not read
- * (a cross-origin URL without CORS) does the service worker retry, using its
- * host permissions and the browser's cookies for that site.
+ * and network path, and follows redirects under the page's own CORS rules.
+ * When the page received a response it may not read (a cross-origin URL
+ * without CORS), nothing more is fetched here: the result asks DSH for user
+ * approval and carries a one-time token bound to this tab and URL, which
+ * page.fetchFileRetry requires.
  */
 async function fetchFileWithTabSession(params) {
   const tabId = requireTabId(params.tabId)
   const frameId = params.frameId === undefined ? 0 : requireFrameId(params.frameId)
-  const url = httpUrl(params.url)
-  const parsedUrl = new URL(url)
-  if (parsedUrl.username || parsedUrl.password) throw new Error('Download URLs cannot contain embedded credentials')
-  let payload = await runInFrame(tabId, frameId, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
-  if (isRecord(payload) && payload.blockedByCors === true) {
-    payload = await fetchFileAsBase64(url, MAX_FETCH_FILE_BYTES, 'extension')
-  }
+  const url = downloadUrl(params.url)
+  const payload = await runInFrame(tabId, frameId, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
   if (!isRecord(payload)) throw new Error('The tab returned no download result')
+  if (payload.blockedByCors === true) {
+    return { tabId, frameId, needsApproval: 'cors-retry', url, retryToken: issueFetchRetryToken(tabId, url) }
+  }
   if (typeof payload.error === 'string') throw new Error(payload.error)
   return { tabId, frameId, ...payload }
 }
 
 /**
+ * Run one user-approved credentialed fetch from the service worker. The token
+ * must match the tab and the exact URL it was issued for, and is consumed
+ * whatever happens. Redirects are not followed: a redirect returns its target
+ * with a fresh token, so DSH can ask the user about that hop too.
+ */
+async function fetchFileApprovedRetry(params) {
+  const tabId = requireTabId(params.tabId)
+  const url = downloadUrl(params.url)
+  consumeFetchRetryToken(params.retryToken, tabId, url)
+  const redirects = []
+  const requested = new URL(url).href
+  const onBeforeRedirect = details => {
+    if (details.tabId === -1 && details.initiator === self.location.origin) redirects.push(details)
+  }
+  const webRequest = chrome.webRequest
+  webRequest?.onBeforeRedirect.addListener(onBeforeRedirect, { urls: ['http://*/*', 'https://*/*'], tabId: -1 })
+  const findHop = () => redirects.findLast(details => details.url === requested)
+  let payload
+  try {
+    payload = await fetchFileAsBase64(url, MAX_FETCH_FILE_BYTES, 'extension', 'manual')
+    // The webRequest event can be dispatched after fetch() resolves.
+    for (let waited = 0; payload?.redirected === true && findHop() === undefined && waited < 2_000; waited += 50) {
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+  } finally {
+    webRequest?.onBeforeRedirect.removeListener(onBeforeRedirect)
+  }
+  if (!isRecord(payload)) throw new Error('The extension returned no download result')
+  if (payload.redirected === true) {
+    const hop = findHop()
+    if (hop === undefined || typeof hop.redirectUrl !== 'string') {
+      throw new Error('The server redirected the download, but the extension could not read the redirect target. Reload the unpacked extension so it has the webRequest permission.')
+    }
+    let location
+    try {
+      location = downloadUrl(hop.redirectUrl)
+    } catch (error) {
+      throw new Error('The server redirected the download to an unsupported URL: ' + String(error?.message ?? error))
+    }
+    return { tabId, needsApproval: 'redirect', url, status: hop.statusCode, location, retryToken: issueFetchRetryToken(tabId, location) }
+  }
+  if (typeof payload.error === 'string') throw new Error(payload.error)
+  return { tabId, frameId: 0, ...payload }
+}
+
+/** An HTTP(S) download URL without embedded credentials, normalized. */
+function downloadUrl(value) {
+  const url = httpUrl(value)
+  const parsedUrl = new URL(url)
+  if (parsedUrl.username || parsedUrl.password) throw new Error('Download URLs cannot contain embedded credentials')
+  return parsedUrl.href
+}
+
+function issueFetchRetryToken(tabId, url) {
+  const now = Date.now()
+  for (const [token, entry] of fetchRetryTokens) {
+    if (entry.expiresAt <= now) fetchRetryTokens.delete(token)
+  }
+  while (fetchRetryTokens.size >= MAX_FETCH_RETRY_TOKENS) {
+    fetchRetryTokens.delete(fetchRetryTokens.keys().next().value)
+  }
+  const token = crypto.randomUUID()
+  fetchRetryTokens.set(token, { tabId, url, expiresAt: now + FETCH_RETRY_TOKEN_TTL_MS })
+  return token
+}
+
+function consumeFetchRetryToken(token, tabId, url) {
+  const entry = typeof token === 'string' ? fetchRetryTokens.get(token) : undefined
+  if (entry !== undefined) fetchRetryTokens.delete(token)
+  if (entry === undefined || entry.expiresAt <= Date.now() || entry.tabId !== tabId || entry.url !== url) {
+    throw new Error('This download retry was not offered by the extension for this tab and URL, or it expired. Run dsh_browser_save_file again.')
+  }
+}
+
+/**
  * Fetch one URL and encode its body. Self-contained: it runs inside the tab
  * frame (via) 'page', and in the service worker as via 'extension'.
- * A page fetch that fails before any response is retried without CORS only
- * when a no-cors probe shows the server answered, so plain network failures
- * are reported instead of retried.
+ * A page fetch that fails before any response is reported as CORS-blocked
+ * only when a no-cors probe shows the server answered, so plain network
+ * failures are reported instead of retried. With redirect 'manual', a
+ * redirect answer is reported as { redirected: true } and not followed.
  */
-async function fetchFileAsBase64(url, maxBytes, via) {
+async function fetchFileAsBase64(url, maxBytes, via, redirect = 'follow') {
   const requester = via === 'page' ? 'The page' : 'The extension'
   let response
   try {
-    response = await fetch(url, { credentials: 'include', cache: 'no-store', redirect: 'follow' })
+    response = await fetch(url, { credentials: 'include', cache: 'no-store', redirect })
   } catch (error) {
     if (via === 'page') {
       try {
@@ -4763,6 +4846,7 @@ async function fetchFileAsBase64(url, maxBytes, via) {
     }
     return { error: requester + ' could not fetch the URL: ' + String(error?.message ?? error) }
   }
+  if (redirect === 'manual' && response.type === 'opaqueredirect') return { redirected: true }
   if (response.type === 'opaque' || response.type === 'opaqueredirect') {
     return via === 'page' ? { blockedByCors: true } : { error: requester + ' cannot read the response' }
   }

@@ -58,7 +58,7 @@ The extension connects to the DSH Web origin configured in its Settings (default
 - Use `dsh_browser_focus` and `dsh_browser_blur` for uniquely selected standard controls. Use `dsh_browser_select` for a native `select` element by exact value, exact label, or zero-based option index. For multiple selects, pass `values`. It dispatches `input` and `change` but does not submit the form. Custom dropdowns need normal click and keyboard actions.
 - Use `dsh_browser_upload` only when the user asks to upload a specific file and provides or authorizes its absolute path. It attaches files to an `input[type=file]`. Selecting files can trigger site input-change handlers and automatic uploads, so treat the tool call itself as a possible upload. Do not submit a form unless asked.
 - Use `dsh_browser_download` only when the task asks to download a file to the user's computer. `start` defaults to Chrome's Save As dialog. `saveAs: false` saves to Chrome's normal Downloads folder on the browser's computer, which this session may not be able to read. Use `status` with the returned download ID to check progress, or `cancel` to stop it. Do not open or run downloaded files automatically.
-- Use `dsh_browser_save_file` when this session needs the file itself, for example to process or reupload it. Pass the `tabId` of the signed-in page that shows the link: the tab fetches the URL with its own session, and the file is written under the session workspace (`.tmp/downloads/` by default, or `directory`). The result gives the path, size, and SHA-256, never the contents, and an existing file is never overwritten. Cookies and tokens stay in the browser.
+- Use `dsh_browser_save_file` when this session needs the file itself, for example to process or reupload it. Pass the `tabId` of the signed-in page that shows the link: the tab fetches the URL with its own session, and the file is written to `.tmp/downloads/` in the session workspace. A cross-origin file the page cannot read, and each redirect it leads to, needs the user's approval; if they decline, report it and do not retry. The result gives the path, size, and SHA-256, never the contents, and an existing file is never overwritten. Cookies and tokens stay in the browser.
 - Use `dsh_browser_wait_user` when browser work requires a human action, including solving a CAPTCHA, completing verification, or choosing a file. Explain the action the user needs to take, then stop browser activity until the user replies. Never automate or bypass a challenge.
 - Use `dsh_browser_tabs` with `action: "open"`, `"activate"`, or `"close"` for tab management.
 - After each consequential action, inspect the live page again with a fresh snapshot, screenshot, HTML read, or task-specific evaluation. Confirm the requested outcome from the page state, not just from the action tool's return value.
@@ -125,7 +125,7 @@ Linux example using a file in Downloads:
 Save a file into the session workspace with `dsh_browser_save_file`, using the signed-in session of tab 123:
 
 ```json
-{"tabId":123,"url":"https://example.com/invoices/42.pdf","directory":"invoices"}
+{"tabId":123,"url":"https://example.com/invoices/42.pdf"}
 ```
 
 Click a button by CSS selector, or click a point from a recent screenshot:
