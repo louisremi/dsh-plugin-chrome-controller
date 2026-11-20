@@ -7,13 +7,59 @@
     <link rel="stylesheet" href="popup.css">
   </head>
   <body>
-    <main>
-      <h1>DeepSeek Harness Browser</h1>
-      <p id="status" role="status">Checking connection...</p>
-      <button id="connect" type="button">Connect to DSH Web</button>
-      <button id="disconnect" type="button" hidden>Disconnect</button>
-      <button id="settings" type="button">Settings</button>
-      <p class="hint">Save the DSH Web address and pairing code in Settings. Connect opens no DSH tab. The extension reconnects after interruptions when automatic connection is enabled.</p>
+    <main id="connection-panel">
+      <header class="popup-header">
+        <img src="assets/icon-32.png" alt="" width="32" height="32">
+        <div class="popup-brand">
+          <h1>Chrome Controller</h1>
+          <p>DeepSeek Harness</p>
+        </div>
+        <button id="settings" class="quiet-button" type="button">Settings</button>
+      </header>
+
+      <section class="notes-menu" aria-label="Element notes">
+        <button id="note-mode" class="primary-button" type="button">Note Mode</button>
+        <div class="notes-menu-grid">
+          <button id="page-notes" type="button">
+            <span>Page Notes</span>
+            <small>Current site</small>
+          </button>
+          <button id="all-notes" type="button">
+            <span>All Notes</span>
+            <small>All domains</small>
+          </button>
+        </div>
+        <p id="notes-feedback" role="status" hidden></p>
+      </section>
+
+      <section class="connection-bar" aria-label="DSH connection">
+        <p id="status" role="status" data-state="working">Checking connection...</p>
+        <button id="connect" type="button" hidden>Connect to DSH Web</button>
+        <button id="disconnect" class="quiet-button" type="button" hidden>Disconnect</button>
+      </section>
+    </main>
+    <main id="note-editor" hidden>
+      <h1>Element note</h1>
+      <p class="hint">Saved notes are available to DSH when you ask it to read them.</p>
+      <label for="note-xpath">Selected element</label>
+      <output id="note-xpath"></output>
+      <form id="note-form">
+        <label for="note-text">Note</label>
+        <textarea id="note-text" rows="5" maxlength="2000" required></textarea>
+        <p id="note-status" role="status"></p>
+        <div class="note-actions">
+          <button id="note-save" type="submit" disabled>Save note</button>
+          <button id="note-remove" type="button" hidden>Remove note</button>
+          <button id="note-cancel" type="button">Cancel</button>
+        </div>
+      </form>
+    </main>
+    <main id="all-notes-panel" hidden>
+      <h1>All Notes</h1>
+      <label for="all-notes-filter">Filter notes</label>
+      <input id="all-notes-filter" type="search" placeholder="Search pages or notes">
+      <p id="all-notes-status" role="status">Loading notes...</p>
+      <div id="all-notes-list"></div>
     </main>
     <script src="popup.js"></script>
   </body>

@@ -1,5 +1,6 @@
-// DSH agent cursor overlay. Injected on demand into agent-controlled tabs via
-// chrome.scripting.executeScript. Draws a virtual cursor (assets/icons8-select-cursor-16.png)
+// Keeps the latest right-click target in the extension's isolated world.
+// Creates the DSH cursor overlay only when a cursor move is requested.
+// Draws a virtual cursor (assets/icons8-select-cursor-16.png)
 // inside a closed shadow root, animates it along a cubic Bezier arc on
 // requestAnimationFrame, and reports arrival back to the background worker.
 // The overlay is purely cosmetic: real input always goes through CDP Input.*
@@ -78,6 +79,14 @@
   if (globalThis.__dshOverlayInstalled === true) return
   globalThis.__dshOverlayInstalled = true
 
+  window.addEventListener('pointerdown', () => { delete globalThis.__dshNoteContext }, { capture: true, passive: true })
+  window.addEventListener('contextmenu', event => {
+    if (!event.isTrusted || !(event.target instanceof Element)) return
+    globalThis.__dshNoteContext = {
+      element: new WeakRef(event.target), url: location.href, time: performance.now(),
+    }
+  }, { capture: true, passive: true })
+
   let host = null
   let shadow = null
   let cursor = null
@@ -97,7 +106,7 @@
   }
 
   function install() {
-    if (host !== null && host.isConnected) return
+    if (document.documentElement === null || (host !== null && host.isConnected)) return
     const existing = document.getElementById(HOST_ID)
     if (existing !== null) {
       existing.remove()
@@ -186,6 +195,7 @@
 
   chrome.runtime.onMessage.addListener(message => {
     if (message?.type === 'DSH_CURSOR_MOVE') {
+      install()
       moveTo(
         Number(message.x), Number(message.y), message.moveSequence, message.animate !== false,
         Number(message.durationMs),
@@ -199,7 +209,5 @@
     return false
   })
 
-  install()
-  // Re-install after navigations remove the document tree.
-  window.addEventListener('pageshow', install)
+  window.addEventListener('pageshow', () => { if (host !== null) install() })
 })()
