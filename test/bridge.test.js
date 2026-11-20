@@ -120,6 +120,15 @@ describe('BrowserExtensionBridge authority admission', () => {
     assert.deepEqual(await result, { tabs: [] })
   })
 
+  it('applies a per-request timeout instead of the configured one', async () => {
+    const context = fakeContext()
+    bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 5000 })
+    await connect(context)
+    const startedAt = Date.now()
+    await assert.rejects(bridge.request('page.fetchFile', {}, undefined, { timeoutMs: 20 }), /timed out/u)
+    assert.ok(Date.now() - startedAt < 1000)
+  })
+
   it('rejects a Host that DSH Web does not trust', async () => {
     const context = fakeContext()
     bridge = await BrowserExtensionBridge.create(context, { operationTimeoutMs: 1000 })
