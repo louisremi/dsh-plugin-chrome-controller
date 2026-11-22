@@ -56,6 +56,21 @@ describe('frameSnapshotPayload behavior', () => {
     assert.equal(payload.url, 'https://shop.test/account')
   })
 
+  it('masks the same sensitive query keys as dsh_browser_evaluate', () => {
+    const anchors = [
+      link('statement', 'https://shop.test/file?token=abc&key=k1&secret=s1&password=p1&session=sid&signature=sig&expires=1&page=2'),
+    ]
+    const payload = run(anchors, 1_000, 100, true)
+    assert.equal(
+      payload.links[0].url,
+      'https://shop.test/file?token=<redacted>&key=<redacted>&secret=<redacted>&password=<redacted>&session=<redacted>&signature=<redacted>&expires=<redacted>&page=2',
+    )
+  })
+
+  it('masks sensitive query keys in the main-frame snapshot expression too', () => {
+    assert.match(source, /\(\[\?&\]\(\?:token\|key\|secret\|password/u)
+  })
+
   it('returns an empty links array with the total still reported when includeLinks is false', () => {
     const anchors = [link('one', 'https://shop.test/1'), link('two', 'https://shop.test/2')]
     const payload = run(anchors, 1_000, 100, false)

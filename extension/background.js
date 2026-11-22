@@ -2105,6 +2105,8 @@ async function executeBrowserOperationNow(method, params, signal) {
           .replace(/(access_token(?:=|%3D))[^&"'\\s]+/gi, '$1<redacted>')
           .replace(/(["']access_token["']\\s*:\\s*["'])[^"']+/gi, '$1<redacted>')
           .replace(/(authorization["']?\\s*[:=]\\s*["']?bearer\\s+)[^"'\\s]+/gi, '$1<redacted>')
+          // The same sensitive query keys dsh_browser_evaluate masks.
+          .replace(/([?&](?:token|key|secret|password|passwd|auth|session|signature|credential|expires|cookie|csrf)=)[^&#\\s"'<>]+/gi, '$1<redacted>')
         const anchors = Array.from(document.querySelectorAll('a[href]'))
         const links = ${includeLinks} ? anchors.slice(0, ${maxLinks}).map(link => ({
           text: redact(link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 120),
@@ -3835,6 +3837,8 @@ function frameSnapshotPayload(maxChars, maxLinks, includeLinks) {
     .replace(/(access_token(?:=|%3D))[^&"'\s]+/gi, '$1<redacted>')
     .replace(/(["']access_token["']\s*:\s*["'])[^"']+/gi, '$1<redacted>')
     .replace(/(authorization["']?\s*[:=]\s*["']?bearer\s+)[^"'\s]+/gi, '$1<redacted>')
+    // The same sensitive query keys dsh_browser_evaluate masks.
+    .replace(/([?&](?:token|key|secret|password|passwd|auth|session|signature|credential|expires|cookie|csrf)=)[^&#\s"'<>]+/gi, '$1<redacted>')
   const text = redact(document.body?.innerText ?? '').slice(0, maxChars)
   const limit = Number.isSafeInteger(maxLinks) ? Math.max(1, Math.min(100, maxLinks)) : 100
   const anchors = Array.from(document.querySelectorAll('a[href]'))
