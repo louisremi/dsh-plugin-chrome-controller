@@ -126,15 +126,36 @@ function loadCaptureSpy() {
   class HTMLAnchorElement {
     click() { this.clicked = true }
   }
+  class FakeXhr {
+    constructor() {
+      this.listeners = {}
+      this.responseURL = ''
+      this.response = undefined
+    }
+    addEventListener(type, listener) { this.listeners[type] = listener }
+    getResponseHeader() { return 'application/pdf' }
+    send() {}
+    emitLoad() { this.listeners.load?.() }
+  }
   const page = {}
+  const pageFetch = async () => ({
+    ok: true,
+    type: 'basic',
+    url: 'https://shop.test/invoice.pdf',
+    headers: { get: name => (name === 'content-type' ? 'application/pdf' : null) },
+    clone: () => ({ arrayBuffer: async () => new Uint8Array([0x25, 0x50, 0x44, 0x46]).buffer }),
+  })
+  page.fetch = pageFetch
+  page.XMLHttpRequest = FakeXhr
   const body = [
     extractFunction('installCaptureDownloadSpy'),
     extractFunction('readCaptureDownloadSpy'),
+    extractFunction('readCaptureDownloadResponseBytes'),
     extractFunction('uninstallCaptureDownloadSpy'),
-    'return { installCaptureDownloadSpy, readCaptureDownloadSpy, uninstallCaptureDownloadSpy }',
+    'return { installCaptureDownloadSpy, readCaptureDownloadSpy, readCaptureDownloadResponseBytes, uninstallCaptureDownloadSpy }',
   ].join('\n')
   const api = new Function('URL', 'HTMLAnchorElement', 'Blob', 'globalThis', body)(url, HTMLAnchorElement, Blob, page)
-  return { ...api, url, HTMLAnchorElement, Blob, page }
+  return { ...api, url, HTMLAnchorElement, Blob, page, pageFetch, FakeXhr }
 }
 
 function downloadAnchor(HTMLAnchorElement, href, download = 'invoice.pdf') {
@@ -174,6 +195,57 @@ describe('capture download spy', () => {
     assert.equal(state.anchors.length, 1)
     assert.equal(state.anchors[0].href, 'https://shop.test/invoice.pdf')
     spy.uninstallCaptureDownloadSpy()
+  })
+
+  it('records fetched response bodies and returns the selected response bytes', async () => {
+    const spy = loadCaptureSpy()
+    const originalFetch = spy.page.fetch
+    spy.installCaptureDownloadSpy()
+    const response = await spy.page.fetch('https://shop.test/invoice.pdf')
+    assert.equal(response.ok, true)
+    // The body is read asynchronously from the response clone.
+    await new Promise(resolve => setTimeout(resolve, 0))
+    assert.deepEqual(spy.readCaptureDownloadSpy().responses.map(({ url, type, size }) => ({ url, type, size })), [
+      { url: 'https://shop.test/invoice.pdf', type: 'application/pdf', size: 4 },
+    ])
+    assert.deepEqual(spy.readCaptureDownloadResponseBytes('https://shop.test/invoice.pdf'), {
+      base64: 'JVBERg==',
+      bytes: 4,
+      contentType: 'application/pdf',
+    })
+    assert.notEqual(spy.page.fetch, originalFetch)
+    spy.uninstallCaptureDownloadSpy()
+    assert.equal(spy.page.fetch, originalFetch)
+    assert.deepEqual(spy.readCaptureDownloadResponseBytes('https://shop.test/invoice.pdf'), { error: 'unavailable' })
+  })
+
+  it('records XHR response bodies, and ignores HTML/JSON responses', async () => {
+    const spy = loadCaptureSpy()
+    spy.installCaptureDownloadSpy()
+    const xhr = new spy.page.XMLHttpRequest()
+    xhr.responseURL = 'https://shop.test/statement.pdf'
+    xhr.response = new Uint8Array([1, 2, 3]).buffer
+    xhr.send()
+    xhr.emitLoad()
+    assert.deepEqual(spy.readCaptureDownloadSpy().responses.map(({ url, size }) => ({ url, size })), [
+      { url: 'https://shop.test/statement.pdf', size: 3 },
+    ])
+    assert.equal(spy.readCaptureDownloadResponseBytes('https://shop.test/statement.pdf').bytes, 3)
+    spy.uninstallCaptureDownloadSpy()
+
+    const htmlSpy = loadCaptureSpy()
+    htmlSpy.page.fetch = async () => ({
+      ok: true,
+      type: 'basic',
+      url: 'https://shop.test/page.html',
+      headers: { get: () => 'text/html; charset=utf-8' },
+      clone: () => ({ arrayBuffer: async () => new Uint8Array([60, 104, 116, 109, 108, 62]).buffer }),
+    })
+    htmlSpy.installCaptureDownloadSpy()
+    await htmlSpy.page.fetch('https://shop.test/page.html')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    assert.deepEqual(htmlSpy.readCaptureDownloadSpy().responses, [])
+    htmlSpy.uninstallCaptureDownloadSpy()
   })
 
   it('restores both originals and is safe to install twice', () => {

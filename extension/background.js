@@ -4887,27 +4887,59 @@ async function captureNetwork(params, signal) {
 
 /**
  * Injected into the clicked tab's main world before the click: record the blob
- * URLs the page creates and the download links its own scripts click. State
- * lives on a window global so a later isolated-world call can read it; the
- * originals are kept so the finally can restore both wrappers. A page
- * navigation discards the state and the wrappers with the old document, which
- * is why the tool reports navigated: true and a second call is the retry.
+ * URLs the page creates, the download links its own scripts click, and the
+ * bodies of the files it fetches with fetch/XHR. State lives on a window global
+ * so a later isolated-world call can read it; the originals are kept so the
+ * finally can restore every wrapper. A page navigation discards the state and
+ * the wrappers with the old document, which is why the tool reports
+ * navigated: true and a second call is the retry.
  */
 function installCaptureDownloadSpy() {
   const KEY = '__dshCaptureDownloadSpy'
   const MAX_RECORDS = 20
+  const MAX_RESPONSES = 8
+  const MAX_RESPONSE_BYTES = 10 * 1024 * 1024
   const previous = globalThis[KEY]
   if (previous !== undefined && previous.active === true) {
     try { URL.createObjectURL = previous.originalCreateObjectURL } catch {}
     try { HTMLAnchorElement.prototype.click = previous.originalAnchorClick } catch {}
+    try { globalThis.fetch = previous.originalFetch } catch {}
+    try {
+      if (globalThis.XMLHttpRequest !== undefined) globalThis.XMLHttpRequest.prototype.send = previous.originalXhrSend
+    } catch {}
   }
   const state = {
     active: true,
     blobs: [],
     anchors: [],
+    responses: [],
     installedAt: Date.now(),
     originalCreateObjectURL: URL.createObjectURL,
     originalAnchorClick: HTMLAnchorElement.prototype.click,
+    originalFetch: globalThis.fetch,
+    originalXhrSend: globalThis.XMLHttpRequest?.prototype?.send,
+  }
+  // A response body the page fetched itself. The bytes stay in the page until
+  // the extension asks for the one file it selected; only file-like types are
+  // kept, so a page's JSON/XHR chatter never costs memory. The debugger's
+  // Network source misses document-fetch responses in practice, so this page
+  // path is what captures an invoice the page fetched with fetch/XHR.
+  const recordResponse = (url, type, buffer) => {
+    try {
+      if (state.responses.length >= MAX_RESPONSES) return
+      if (!(buffer instanceof ArrayBuffer)) return
+      const size = buffer.byteLength
+      if (size === 0 || size > MAX_RESPONSE_BYTES) return
+      const mime = String(type ?? '').split(';')[0].trim().toLowerCase()
+      if (mime === 'text/html' || mime === 'application/xhtml+xml' || mime === 'text/css'
+        || mime === 'application/json' || mime.endsWith('+json')
+        || mime.includes('javascript') || mime.includes('ecmascript')) return
+      const text = String(url ?? '')
+      if (text === '' || text.startsWith('blob:')) return
+      state.responses.push({ url: text, type: String(type ?? ''), size, buffer, at: Date.now() })
+    } catch {
+      // Recording is best-effort; the page's request still runs.
+    }
   }
   URL.createObjectURL = function createObjectURL(object) {
     const url = state.originalCreateObjectURL.call(URL, object)
@@ -4939,27 +4971,95 @@ function installCaptureDownloadSpy() {
     }
     return state.originalAnchorClick.call(this)
   }
+  if (typeof state.originalFetch === 'function') {
+    globalThis.fetch = function captureDownloadFetch(...args) {
+      const result = state.originalFetch.apply(this, args)
+      try {
+        result.then(response => {
+          try {
+            if (!response || response.ok === false || response.type === 'opaque' || response.type === 'opaqueredirect') return
+            const headers = response.headers
+            const type = typeof headers?.get === 'function' ? headers.get('content-type') : ''
+            response.clone().arrayBuffer()
+              .then(buffer => recordResponse(response.url, type, buffer))
+              .catch(() => {})
+          } catch {
+            // A streamed or opaque response cannot be cloned; the page still gets it.
+          }
+        }).catch(() => {})
+      } catch {
+        // The request still runs; only the recording is skipped.
+      }
+      return result
+    }
+  }
+  if (typeof state.originalXhrSend === 'function') {
+    globalThis.XMLHttpRequest.prototype.send = function captureDownloadXhrSend(...args) {
+      try {
+        this.addEventListener('load', () => {
+          try {
+            const url = this.responseURL
+            const type = this.getResponseHeader('content-type') ?? ''
+            const response = this.response
+            if (response instanceof Blob) {
+              response.arrayBuffer()
+                .then(buffer => recordResponse(url, type || response.type, buffer))
+                .catch(() => {})
+            } else if (response instanceof ArrayBuffer) {
+              recordResponse(url, type, response.slice(0))
+            } else if (typeof response === 'string') {
+              recordResponse(url, type, new TextEncoder().encode(response).buffer)
+            }
+          } catch {
+            // A response type we cannot read is skipped; the page still gets it.
+          }
+        }, { once: true })
+      } catch {
+        // The request still runs; only the recording is skipped.
+      }
+      return state.originalXhrSend.apply(this, args)
+    }
+  }
   globalThis[KEY] = state
   return { installed: true }
 }
 
-/** Injected into the clicked tab: read the capture spy's recorded blobs and anchors. */
+/** Injected into the clicked tab: read the capture spy's recorded blobs, anchors, and fetches. */
 function readCaptureDownloadSpy() {
   const state = globalThis.__dshCaptureDownloadSpy
-  if (state === undefined || state.active !== true) return { active: false, blobs: [], anchors: [] }
+  if (state === undefined || state.active !== true) return { active: false, blobs: [], anchors: [], responses: [] }
   return {
     active: true,
     blobs: state.blobs.map(record => ({ url: record.url, type: record.type, size: record.size, at: record.at })),
     anchors: state.anchors.map(record => ({ href: record.href, download: record.download, at: record.at })),
+    responses: state.responses.map(record => ({ url: record.url, type: record.type, size: record.size, at: record.at })),
   }
 }
 
-/** Injected into the clicked tab: restore URL.createObjectURL and anchor clicks. */
+/** Injected into the clicked tab: the bytes of one page-fetched response the capture accepted. */
+function readCaptureDownloadResponseBytes(url) {
+  const state = globalThis.__dshCaptureDownloadSpy
+  if (state === undefined || state.active !== true || typeof url !== 'string') return { error: 'unavailable' }
+  const record = Array.isArray(state.responses) ? state.responses.find(item => item.url === url) : undefined
+  if (record === undefined || !(record.buffer instanceof ArrayBuffer)) return { error: 'unavailable' }
+  const bytes = new Uint8Array(record.buffer)
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000))
+  }
+  return { base64: btoa(binary), bytes: bytes.length, contentType: typeof record.type === 'string' ? record.type : '' }
+}
+
+/** Injected into the clicked tab: restore every wrapper the spy replaced. */
 function uninstallCaptureDownloadSpy() {
   const state = globalThis.__dshCaptureDownloadSpy
   if (state === undefined) return { removed: false }
   try { URL.createObjectURL = state.originalCreateObjectURL } catch {}
   try { HTMLAnchorElement.prototype.click = state.originalAnchorClick } catch {}
+  try { if (typeof state.originalFetch === 'function') globalThis.fetch = state.originalFetch } catch {}
+  try {
+    if (typeof state.originalXhrSend === 'function') globalThis.XMLHttpRequest.prototype.send = state.originalXhrSend
+  } catch {}
   state.active = false
   delete globalThis.__dshCaptureDownloadSpy
   return { removed: true }
@@ -5284,6 +5384,17 @@ async function collectCaptureDownloadBlobs(state) {
     state.seenUrls.add(url)
     await collectCaptureDownloadBlob(state, url)
   }
+  // A file the page fetched with fetch/XHR: the bytes stay in the page until a
+  // capture accepts this response.
+  const responses = Array.isArray(snapshot.responses) ? snapshot.responses : []
+  for (const response of responses) {
+    const url = captureCandidateUrl(response?.url)
+    if (url === undefined || state.seenUrls.has(url)) continue
+    const contentType = typeof response?.type === 'string' ? response.type : ''
+    if (!matchesAccept({ contentType, url }, state.accept)) continue
+    state.seenUrls.add(url)
+    await collectCaptureDownloadResponse(state, { ...response, url })
+  }
 }
 
 /** Read one page-created blob's bytes inside the page; the model never sees the blob URL. */
@@ -5306,6 +5417,30 @@ async function collectCaptureDownloadBlob(state, url) {
     base64: payload.base64,
     bytes,
     observedAt: Date.now(),
+  })
+}
+
+/** Read one page-fetched response's bytes from the page and record it as a candidate. */
+async function collectCaptureDownloadResponse(state, response) {
+  let payload
+  try {
+    payload = await runInFrame(state.tabId, 0, readCaptureDownloadResponseBytes, [response.url], 'MAIN')
+  } catch {
+    return
+  }
+  if (!isRecord(payload) || typeof payload.base64 !== 'string') return
+  const bytes = base64ByteLength(payload.base64)
+  if (bytes === 0 || bytes > MAX_FETCH_FILE_BYTES) return
+  recordCaptureDownloadCandidate(state, {
+    source: 'bytes',
+    via: 'response',
+    url: response.url,
+    contentType: typeof payload.contentType === 'string' && payload.contentType !== ''
+      ? payload.contentType
+      : (typeof response.type === 'string' ? response.type : ''),
+    base64: payload.base64,
+    bytes,
+    observedAt: Number.isFinite(response.at) ? response.at : Date.now(),
   })
 }
 
