@@ -4286,6 +4286,29 @@ async function captureNetwork(params, signal) {
   if (!Number.isSafeInteger(maxRequestBodyChars) || maxRequestBodyChars < 1 || maxRequestBodyChars > MAX_NETWORK_BODY_CHARS) {
     throw new Error('maxRequestBodyChars must be an integer between 1 and ' + String(MAX_NETWORK_BODY_CHARS))
   }
+  if (params.urlIncludes !== undefined) {
+    if (!Array.isArray(params.urlIncludes) || params.urlIncludes.length < 1 || params.urlIncludes.length > 10) {
+      throw new Error('urlIncludes must contain between 1 and 10 substrings')
+    }
+    for (const item of params.urlIncludes) {
+      if (typeof item !== 'string' || item.length === 0 || item.length > 1_000) {
+        throw new Error('Each urlIncludes entry must be a non-empty string of at most 1000 characters')
+      }
+    }
+  }
+  if (params.resourceTypes !== undefined) {
+    if (!Array.isArray(params.resourceTypes) || params.resourceTypes.length < 1 || params.resourceTypes.length > 20) {
+      throw new Error('resourceTypes must contain between 1 and 20 resource types')
+    }
+    for (const item of params.resourceTypes) {
+      if (typeof item !== 'string' || item.length === 0 || item.length > 100) {
+        throw new Error('Each resourceTypes entry must be a non-empty string of at most 100 characters')
+      }
+    }
+  }
+  if (params.omitHeaders !== undefined && typeof params.omitHeaders !== 'boolean') {
+    throw new Error('omitHeaders must be a boolean')
+  }
 
   let sequence
   if (params.steps !== undefined) {
@@ -4481,14 +4504,22 @@ async function captureNetwork(params, signal) {
         }
       }
 
+      const capturedRequests = [...requests.values()].map(({ finished, ...request }) => request)
+      const filtered = filterNetworkRequests(capturedRequests, {
+        urlIncludes: params.urlIncludes,
+        resourceTypes: params.resourceTypes,
+        omitHeaders: params.omitHeaders === true,
+      })
       const result = {
         tabId,
         capturedMs: Date.now() - captureStartedAt,
         sensitiveDataIncluded: includeSensitiveData,
-        requestCount: requests.size,
+        requestCount: filtered.requests.length,
+        totalRequestCount: capturedRequests.length,
         truncated,
-        requests: [...requests.values()].map(({ finished, ...request }) => request),
+        requests: filtered.requests,
       }
+      if (filtered.filteredOut > 0) result.requestsFilteredOut = filtered.filteredOut
       if (cookies !== undefined) {
         result.cookies = cookies
         result.cookieCount = cookieCount
@@ -4500,6 +4531,7 @@ async function captureNetwork(params, signal) {
       }
       if (largeResponseBodiesSkipped > 0) result.responseBodiesSkippedLarge = largeResponseBodiesSkipped
       if (requestBodiesLimited) result.requestBodiesLimited = MAX_NETWORK_RESPONSE_BODIES
+      result.resultChars = JSON.stringify(result).length
       return result
     } finally {
       chrome.debugger.onEvent.removeListener(onEvent)
@@ -4509,8 +4541,18 @@ async function captureNetwork(params, signal) {
 }
 
 function redactNetworkUrl(value, includeSensitiveData = false) {
+  const text = String(value)
+  // A data: URL carries file bytes; always replace it with a compact
+  // placeholder, even when the caller asked for sensitive data.
+  if (/^data:/iu.test(text)) {
+    const header = /^data:([^,]*),/iu.exec(text)
+    const metadata = header === null ? '' : header[1]
+    const base64 = /(?:^|;)base64(?:;|$)/iu.test(metadata)
+    const mime = /^([^;]+)/u.exec(metadata)?.[1]?.trim() || (base64 ? 'application/octet-stream' : 'data')
+    return 'data:' + mime + (base64 ? ';base64,' : ',') + '…[' + String(text.length) + ' chars elided]'
+  }
   try {
-    const url = new URL(String(value))
+    const url = new URL(text)
     if (includeSensitiveData) return url.href.slice(0, 2_048)
     url.username = ''
     url.password = ''
@@ -4530,24 +4572,66 @@ function redactNetworkHeaders(headers, includeSensitiveData = false, baseUrl = u
   if (!isRecord(headers)) return {}
   return Object.fromEntries(Object.entries(headers).slice(0, 100).map(([name, value]) => {
     const normalizedName = String(name).toLowerCase()
+    const text = String(value)
     let safeValue
-    if (includeSensitiveData) safeValue = String(value).slice(0, 1_000)
+    if (/^data:/iu.test(text)) safeValue = redactNetworkUrl(text)
+    else if (includeSensitiveData) safeValue = text.slice(0, 1_000)
     else if (normalizedName === ':path') safeValue = redactNetworkPath(value, baseUrl)
     else if (/authorization|cookie|token|secret|password|credential|api[-_]?key|session|csrf|signature|proxy-auth/i.test(normalizedName)) {
       safeValue = '[REDACTED]'
-    } else safeValue = String(value).slice(0, 1_000)
+    } else safeValue = text.slice(0, 1_000)
     return [String(name).slice(0, 200), safeValue]
   }))
 }
 
 function redactNetworkPath(value, baseUrl) {
+  const text = String(value)
+  if (/^data:/iu.test(text)) return redactNetworkUrl(text)
   try {
-    const url = new URL(String(value), baseUrl)
+    const url = new URL(text, baseUrl)
     const safeUrl = new URL(redactNetworkUrl(url.href))
     return (safeUrl.pathname || '/') + safeUrl.search
   } catch {
-    return String(value).slice(0, 1_000)
+    return text.slice(0, 1_000)
   }
+}
+
+/**
+ * Narrow captured records for the caller. A request matches urlIncludes when
+ * its request URL, any redirect URL, or its response URL contains one of the
+ * substrings (case-insensitive). Filters combine, and omitHeaders drops the
+ * header maps without touching cookies or opted-in bodies. Pure so tests can
+ * extract it from this file, which the service worker cannot be imported from.
+ */
+function filterNetworkRequests(requests, options = {}) {
+  const list = Array.isArray(requests) ? requests : []
+  const includes = Array.isArray(options.urlIncludes) ? options.urlIncludes : []
+  const types = Array.isArray(options.resourceTypes) ? options.resourceTypes : []
+  const needles = includes.map(item => String(item).toLowerCase()).filter(item => item !== '')
+  const keep = list.filter(record => {
+    if (types.length > 0 && !types.includes(String(record?.resourceType ?? ''))) return false
+    if (needles.length === 0) return true
+    const urls = [record?.url, record?.response?.url]
+    if (Array.isArray(record?.redirects)) {
+      for (const redirect of record.redirects) urls.push(redirect?.url)
+    }
+    return urls.some(url => typeof url === 'string' && needles.some(needle => url.toLowerCase().includes(needle)))
+  })
+  const filteredOut = list.length - keep.length
+  if (options.omitHeaders !== true) return { requests: keep, filteredOut }
+  const stripped = keep.map(record => {
+    const copy = { ...record }
+    delete copy.requestHeaders
+    delete copy.pendingResponseExtraHeaders
+    if (copy.response !== null && typeof copy.response === 'object' && !Array.isArray(copy.response)) {
+      const response = { ...copy.response }
+      delete response.headers
+      delete response.extraHeaders
+      copy.response = response
+    }
+    return copy
+  })
+  return { requests: stripped, filteredOut }
 }
 
 function isTextNetworkMime(mimeType) {
