@@ -296,11 +296,11 @@ describe('capture download wiring', () => {
 const CAPTURE_FUNCTION_NAMES = [
   'installCaptureDownloadSpy', 'readCaptureDownloadSpy', 'uninstallCaptureDownloadSpy',
   'encodeBase64Bytes', 'base64ByteLength', 'requireCaptureAccept',
-  'captureCandidateUrl', 'captureSourceOrigin', 'networkResponseContentType',
+  'captureCandidateUrl', 'captureSourceOrigin', 'captureSuggestedFileName', 'networkResponseContentType',
   'networkResponseDisposition', 'downloadBelongsToTab', 'discardChromeDownload',
   'closeCaptureDownloadTab', 'recordCaptureDownloadCandidate', 'createCaptureDownloadState',
   'loadCaptureDownloadResponseBody', 'armCaptureDownloadSources', 'disarmCaptureDownloadSources',
-  'collectCaptureDownloadBlobs', 'collectCaptureDownloadBlob', 'collectCaptureDownloadTabs',
+  'collectCaptureDownloadBlobs', 'collectCaptureDownloadBlob', 'collectCaptureDownloadResponse', 'readCaptureDownloadResponseBytes', 'collectCaptureDownloadTabs',
   'collectCaptureDownloadCandidates', 'captureCandidateKey', 'chooseCapturedDownload',
   'capturedDownloadResult', 'captureDownload',
 ]
@@ -407,12 +407,13 @@ function createCaptureEnvironment({ click = () => {}, tab = { id: 7, url: 'https
   }
   const runInFrame = async (_tabId, _frameId, func, args) => {
     if (func.name === 'installCaptureDownloadSpy') return { installed: true }
-    if (func.name === 'readCaptureDownloadSpy') return { active: true, blobs: environment.blobs, anchors: [] }
+    if (func.name === 'readCaptureDownloadSpy') return { active: true, blobs: environment.blobs, anchors: environment.anchors ?? [], responses: environment.responses ?? [] }
     if (func.name === 'uninstallCaptureDownloadSpy') {
       environment.spyUninstalled = true
       return { removed: true }
     }
     if (func.name === 'fetchFileAsBase64') return environment.blobPayload(args[0])
+    if (func.name === 'readCaptureDownloadResponseBytes') return environment.responsePayload?.(args[0]) ?? { error: 'unavailable' }
     throw new Error('Unexpected injected function ' + func.name)
   }
   environment.download = item => { for (const listener of listeners.downloads) listener(item) }
@@ -606,6 +607,64 @@ describe('capture download orchestration', () => {
     assert.equal(environment.spyUninstalled, true)
     // The blob URL is internal: the plugin receives it only to name the file.
     assert.equal(result.url, blobUrl)
+  })
+
+  it('attributes a download a popup tab started, and keeps its suggested name', async () => {
+    const environment = createCaptureEnvironment({
+      click: env => {
+        // window.open with noopener: no opener and no URL yet, then the popup
+        // document downloads the file itself.
+        env.tabOpened({ id: 9 })
+        env.download({
+          id: 8,
+          tabId: 9,
+          url: 'https://shop.test/getDoc?orderId=42&docId=7',
+          finalUrl: 'https://shop.test/getDoc?orderId=42&docId=7',
+          mime: 'application/pdf',
+          filename: '/home/user/Downloads/tax-invoice.pdf',
+        })
+      },
+    })
+    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 300 })
+    assert.equal(result.captured, true)
+    assert.equal(result.source, 'url')
+    assert.equal(result.via, 'window-open')
+    assert.equal(result.suggestedFileName, 'tax-invoice.pdf')
+    assert.equal(result.sourceOrigin, 'https://shop.test')
+    assert.deepEqual(environment.calls.cancelled, [8])
+    // The unattributed popup tab belongs to the page, not to the capture.
+    assert.deepEqual(environment.calls.removedTabs, [])
+  })
+
+  it('reads a blob the page created through its download anchor and keeps the anchor name', async () => {
+    const bytes = Buffer.from('%PDF-1.7 fetched')
+    const environment = createCaptureEnvironment({ click: () => {} })
+    environment.anchors = [{ href: 'blob:https://shop.test/1', download: 'facture-42.pdf', at: 5 }]
+    environment.blobPayload = () => ({
+      via: 'page',
+      finalUrl: 'blob:https://shop.test/1',
+      contentType: 'application/pdf',
+      contentDisposition: '',
+      bytes: bytes.length,
+      base64: bytes.toString('base64'),
+    })
+    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 300 })
+    assert.equal(result.captured, true)
+    assert.equal(result.via, 'blob-anchor')
+    assert.equal(result.suggestedFileName, 'facture-42.pdf')
+    assert.equal(Buffer.from(result.base64, 'base64').toString(), '%PDF-1.7 fetched')
+  })
+
+  it('reads a response body recorded by the page fetch spy', async () => {
+    const bytes = Buffer.from('%PDF-1.7 page-fetch')
+    const environment = createCaptureEnvironment({ click: () => {} })
+    environment.responses = [{ url: 'https://shop.test/invoice.pdf', type: 'application/pdf', size: bytes.length, at: 5 }]
+    environment.responsePayload = () => ({ base64: bytes.toString('base64'), bytes: bytes.length, contentType: 'application/pdf' })
+    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 300 })
+    assert.equal(result.captured, true)
+    assert.equal(result.source, 'bytes')
+    assert.equal(result.via, 'response')
+    assert.equal(Buffer.from(result.base64, 'base64').toString(), '%PDF-1.7 page-fetch')
   })
 
   it('disarms every source when the click itself fails', async () => {

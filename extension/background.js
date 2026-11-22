@@ -5145,11 +5145,24 @@ function networkResponseDisposition(response) {
 
 /** Whether a Chrome download belongs to the clicked tab. Chrome reports -1 for a download it cannot attribute. */
 function downloadBelongsToTab(item, state) {
-  if (Number.isInteger(item?.tabId) && item.tabId >= 0) return item.tabId === state.tabId
+  if (Number.isInteger(item?.tabId) && item.tabId >= 0) {
+    if (item.tabId === state.tabId) return true
+    // A document the click opened in a new tab can start the download itself
+    // (Microsoft's window.open popup does), so its tab is ours too.
+    return state.openedTabs.has(item.tabId) || state.unattributedTabs.has(item.tabId)
+  }
   const referrer = typeof item?.referrer === 'string' ? item.referrer : ''
   if (referrer === '') return false
   if (state.tabUrl !== '' && referrer === state.tabUrl) return true
   return state.tabOrigin !== '' && captureSourceOrigin(referrer) === state.tabOrigin
+}
+
+/** A file name Chrome proposed for a download, stripped to its last segment. */
+function captureSuggestedFileName(value) {
+  if (typeof value !== 'string' || value === '') return undefined
+  const base = value.split(/[\\/]/u).pop() ?? ''
+  const name = base.trim().slice(0, 200).trim()
+  return name === '' ? undefined : name
 }
 
 /** Cancel and erase one Chrome download the capture intercepted. */
@@ -5186,6 +5199,10 @@ function createCaptureDownloadState({ tabId, tabUrl, tabOrigin, accept }) {
     lastSpyReadAt: 0,
     seenUrls: new Set(),
     openedTabs: new Map(),
+    // Tabs that appeared without an opener and without a URL while the capture
+    // was armed. A download started from one of them is this click's document
+    // (Microsoft's window.open popup does this), but the tab is not closed.
+    unattributedTabs: new Set(),
     pendingDiscards: new Set(),
     responseRequests: new Map(),
     responseBodies: 0,
@@ -5199,11 +5216,16 @@ function createCaptureDownloadState({ tabId, tabUrl, tabOrigin, accept }) {
       if (Number.isSafeInteger(item.id)) state.pendingDiscards.add(discardChromeDownload(item.id))
       const url = captureCandidateUrl(item.finalUrl || item.url)
       if (url === undefined) return
+      // A download started in a tab the click opened is a window-open capture;
+      // one started in the clicked tab is a plain download.
+      const openedTab = Number.isSafeInteger(item.tabId) && item.tabId >= 0 && item.tabId !== state.tabId
+      const suggestedFileName = captureSuggestedFileName(item.filename)
       recordCaptureDownloadCandidate(state, {
         source: 'url',
-        via: 'download',
+        via: openedTab ? 'window-open' : 'download',
         url,
         contentType: typeof item.mime === 'string' ? item.mime : '',
+        ...(suggestedFileName === undefined ? {} : { suggestedFileName }),
         ...(Number.isSafeInteger(item.fileSize) && item.fileSize > 0 ? { bytes: item.fileSize } : {}),
         observedAt: Date.now(),
       })
@@ -5216,10 +5238,13 @@ function createCaptureDownloadState({ tabId, tabUrl, tabOrigin, accept }) {
       if (!isRecord(tab) || !Number.isSafeInteger(tab.id)) return
       if (tab.openerTabId !== undefined && tab.openerTabId !== state.tabId) return
       const known = captureCandidateUrl(tab.pendingUrl) ?? captureCandidateUrl(tab.url)
-      // A tab with no opener and no file URL (an operator's Ctrl+T) is not
-      // ours: only tabs the click opened, or that already load a URL, are
-      // tracked and later closed.
-      if (tab.openerTabId !== state.tabId && known === undefined) return
+      if (tab.openerTabId !== state.tabId && known === undefined) {
+        // No opener and no URL: a popup the click opened with noopener. It can
+        // still start the document download itself, so remember it for
+        // download attribution without closing an operator's own new tab.
+        state.unattributedTabs.add(tab.id)
+        return
+      }
       if (!state.openedTabs.has(tab.id)) state.openedTabs.set(tab.id, undefined)
     } catch {
       // Ignore a tab event that cannot be read.
@@ -5362,14 +5387,16 @@ async function collectCaptureDownloadBlobs(state) {
     const url = captureCandidateUrl(anchor?.href)
     if (url === undefined || state.seenUrls.has(url)) continue
     state.seenUrls.add(url)
+    const suggestedFileName = captureSuggestedFileName(anchor?.download)
     if (/^blob:/iu.test(url)) {
-      await collectCaptureDownloadBlob(state, url)
+      await collectCaptureDownloadBlob(state, url, suggestedFileName)
     } else {
       recordCaptureDownloadCandidate(state, {
         source: 'url',
         via: 'blob-anchor',
         url,
         contentType: '',
+        ...(suggestedFileName === undefined ? {} : { suggestedFileName }),
         observedAt: Number.isFinite(anchor?.at) ? anchor.at : Date.now(),
       })
     }
@@ -5398,7 +5425,7 @@ async function collectCaptureDownloadBlobs(state) {
 }
 
 /** Read one page-created blob's bytes inside the page; the model never sees the blob URL. */
-async function collectCaptureDownloadBlob(state, url) {
+async function collectCaptureDownloadBlob(state, url, suggestedFileName) {
   let payload
   try {
     payload = await runInFrame(state.tabId, 0, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
@@ -5414,6 +5441,7 @@ async function collectCaptureDownloadBlob(state, url) {
     url,
     contentType: typeof payload.contentType === 'string' ? payload.contentType : '',
     contentDisposition: typeof payload.contentDisposition === 'string' ? payload.contentDisposition : '',
+    ...(suggestedFileName === undefined ? {} : { suggestedFileName }),
     base64: payload.base64,
     bytes,
     observedAt: Date.now(),
@@ -5516,6 +5544,8 @@ function capturedDownloadResult(state, choice) {
     contentType: typeof selected.contentType === 'string' ? selected.contentType : '',
     ...(typeof selected.contentDisposition === 'string' && selected.contentDisposition !== ''
       ? { contentDisposition: selected.contentDisposition } : {}),
+    ...(typeof selected.suggestedFileName === 'string' && selected.suggestedFileName !== ''
+      ? { suggestedFileName: selected.suggestedFileName } : {}),
     ...(typeof selected.url === 'string' ? { url: selected.url } : {}),
     sourceOrigin: captureSourceOrigin(selected.url),
     navigated: state.navigated,

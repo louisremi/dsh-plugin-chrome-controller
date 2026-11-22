@@ -197,6 +197,52 @@ describe('dsh_browser_capture_download', () => {
     assert.deepEqual(await readFile(join(root, '.tmp', 'downloads', 'Invoice-42.pdf')), pdf)
   })
 
+  it('uses the download name the extension suggests when the caller gave none', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const zip = Buffer.from('PK\x03\x04 stored zip of invoices')
+    const answer = await pairAndAnswer(context, () => ({
+      captured: true,
+      source: 'bytes',
+      via: 'window-open',
+      base64: zip.toString('base64'),
+      bytes: zip.length,
+      contentType: 'application/zip',
+      sourceOrigin: 'https://shop.test',
+      navigated: false,
+      suggestedFileName: 'Laposte_Factures_140926_300926.zip',
+      also: [],
+    }))
+    const pending = tool().execute({ tabId: 7, text: 'Télécharger', timeoutMs: 5_000, accept: ['application/zip'] }, exec())
+    await answer()
+    const result = await pending
+    assert.equal(result.saved, true)
+    assert.equal(result.relativePath, '.tmp/downloads/Laposte_Factures_140926_300926.zip')
+    assert.ok(!JSON.stringify(result).includes('suggestedFileName'))
+    assert.deepEqual(await readFile(join(root, '.tmp', 'downloads', 'Laposte_Factures_140926_300926.zip')), zip)
+  })
+
+  it('prefers an explicit filename over the suggested download name', async () => {
+    context = fakePluginContext({ root })
+    await apply(context)
+    const pdf = Buffer.from('%PDF-1.7 explicit')
+    const answer = await pairAndAnswer(context, () => ({
+      captured: true,
+      source: 'bytes',
+      via: 'download',
+      base64: pdf.toString('base64'),
+      bytes: pdf.length,
+      contentType: 'application/pdf',
+      sourceOrigin: 'https://shop.test',
+      navigated: false,
+      suggestedFileName: 'suggested-name.pdf',
+      also: [],
+    }))
+    const pending = tool().execute({ tabId: 7, text: 'Télécharger', filename: 'mine.pdf', timeoutMs: 5_000 }, exec())
+    await answer()
+    assert.equal((await pending).relativePath, '.tmp/downloads/mine.pdf')
+  })
+
   it('fetches a URL the click exposed through the tab, and saves it without exposing the URL', async () => {
     context = fakePluginContext({ root })
     await apply(context)
