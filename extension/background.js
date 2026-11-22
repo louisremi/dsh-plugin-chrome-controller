@@ -1,4 +1,5 @@
 import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
+import { sanitizeEvaluationValue } from './evaluation-sanitize.js'
 
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
 const CONNECT_PATH = '/dsh-browser-extension/connect'
@@ -36,6 +37,9 @@ const MAX_SNAPSHOT_CHARS = 30_000
 const MAX_HTML_CHARS = 100_000
 const MAX_SOURCE_CHARS = 100_000
 const MAX_EVALUATION_CHARS = 50_000
+// Evaluation results are sanitized and capped by default; callers may raise or
+// lower the cap up to MAX_EVALUATION_RESULT_CHARS.
+const DEFAULT_EVALUATION_RESULT_CHARS = 20_000
 const MAX_EVALUATION_RESULT_CHARS = 100_000
 const MAX_WORKBOOK_CELLS = 10_000
 const MAX_WORKBOOK_RESULT_CHARS = 1_000_000
@@ -1128,7 +1132,7 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     reload: { method: 'page.reload', required: [], allowed: [] },
     wait: { method: 'page.wait', required: ['durationMs'], allowed: ['durationMs'] },
     wait_for_element: { method: 'page.waitForElement', required: ['selector'], allowed: ['selector', 'state', 'timeoutMs', 'pollIntervalMs'] },
-    evaluate: { method: 'page.evaluate', required: ['expression'], allowed: ['expression', 'timeoutMs'] },
+    evaluate: { method: 'page.evaluate', required: ['expression'], allowed: ['expression', 'timeoutMs', 'maxChars'] },
     snapshot: { method: 'page.snapshot', required: [], allowed: ['maxChars'] },
     get_html: { method: 'page.html', required: [], allowed: ['selector', 'maxChars'] },
     get_source: { method: 'page.source', required: [], allowed: ['maxChars'] },
@@ -1259,6 +1263,10 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     if (step.action === 'evaluate' && (stepParams.expression.trim() === ''
       || stepParams.expression.length > MAX_EVALUATION_CHARS)) {
       throw new Error('Sequence step ' + String(index + 1) + ' has an invalid JavaScript expression')
+    }
+    if (step.action === 'evaluate' && stepParams.maxChars !== undefined
+      && (stepParams.maxChars < 1 || stepParams.maxChars > MAX_EVALUATION_RESULT_CHARS)) {
+      throw new Error('Sequence evaluate maxChars must be between 1 and ' + String(MAX_EVALUATION_RESULT_CHARS))
     }
     if (step.action === 'snapshot' && stepParams.maxChars !== undefined
       && stepParams.maxChars < 1) throw new Error('Sequence snapshot maxChars must be positive')
@@ -1843,9 +1851,12 @@ async function executeBrowserOperationNow(method, params, signal) {
       const timeoutMs = Number.isInteger(params.timeoutMs)
         ? Math.max(1, Math.min(MAX_EVALUATION_TIMEOUT_MS, params.timeoutMs))
         : DEFAULT_EVALUATION_TIMEOUT_MS
+      const maxChars = Number.isInteger(params.maxChars)
+        ? Math.max(1, Math.min(MAX_EVALUATION_RESULT_CHARS, params.maxChars))
+        : DEFAULT_EVALUATION_RESULT_CHARS
       if (params.frameId !== undefined) {
         const frameId = requireFrameId(params.frameId)
-        const payload = await evaluateInFrame(tabId, frameId, params.expression)
+        const payload = await evaluateInFrame(tabId, frameId, params.expression, maxChars)
         return { tabId, frameId, ...payload }
       }
       return withDebugger(tabId, async target => {
@@ -1863,16 +1874,7 @@ async function executeBrowserOperationNow(method, params, signal) {
         }
         const remote = response.result ?? {}
         if (remote.value !== undefined) {
-          const serialized = JSON.stringify(remote.value)
-          if (serialized.length > MAX_EVALUATION_RESULT_CHARS) {
-            return {
-              tabId,
-              type: remote.type ?? 'object',
-              valueText: serialized.slice(0, MAX_EVALUATION_RESULT_CHARS),
-              truncated: true,
-            }
-          }
-          return { tabId, type: remote.type ?? typeof remote.value, value: remote.value }
+          return { tabId, type: remote.type ?? typeof remote.value, ...sanitizeEvaluationValue(remote.value, { maxChars }) }
         }
         if (remote.unserializableValue !== undefined) {
           return { tabId, type: remote.type ?? 'undefined', value: remote.unserializableValue }
@@ -4253,16 +4255,12 @@ function frameWopiContextPayload() {
 }
 
 /** Evaluate one expression inside a specific frame via chrome.scripting (covers cross-origin frames). */
-async function evaluateInFrame(tabId, frameId, expression) {
+async function evaluateInFrame(tabId, frameId, expression, maxChars = DEFAULT_EVALUATION_RESULT_CHARS) {
   const payload = await runInFrame(tabId, frameId, frameEvalPayload, [expression])
   if (!isRecord(payload)) throw new Error('The frame returned no result')
   if (payload.ok !== true) throw new Error(String(payload.error ?? 'Frame evaluation failed'))
   const value = payload.value
-  const serialized = JSON.stringify(value)
-  if (serialized !== undefined && serialized.length > MAX_EVALUATION_RESULT_CHARS) {
-    return { type: typeof value, valueText: serialized.slice(0, MAX_EVALUATION_RESULT_CHARS), truncated: true }
-  }
-  return { type: typeof value, value }
+  return { type: typeof value, ...sanitizeEvaluationValue(value, { maxChars }) }
 }
 
 async function captureNetwork(params, signal) {
