@@ -113,6 +113,8 @@ const DEBUGGER_VIEWPORT_POLL_MS = 100
 const DEBUGGER_VIEWPORT_STABLE_SAMPLES = 2
 const DEBUGGER_VIEWPORT_MAX_SAMPLES = 10
 const NAVIGATION_TIMEOUT_MS = 25_000
+// tabs.open waits for the new tab to report 'complete'; the plugin can override this.
+const TABS_OPEN_TIMEOUT_MS = 15_000
 const MIN_DRAG_DURATION_MS = 100
 const MAX_DRAG_DURATION_MS = 2_000
 const MAX_NETWORK_CAPTURE_MS = 10_000
@@ -1769,8 +1771,23 @@ async function executeBrowserOperationNow(method, params, signal) {
       return { tabs: await getTabs() }
     case 'tabs.open': {
       const url = httpUrl(params.url)
+      const waitForLoad = params.waitForLoad !== false
+      const timeoutMs = Number.isSafeInteger(params.timeoutMs)
+        && params.timeoutMs >= 1 && params.timeoutMs <= NAVIGATION_TIMEOUT_MS
+        ? params.timeoutMs
+        : TABS_OPEN_TIMEOUT_MS
       const tab = await chrome.tabs.create({ url, active: params.active !== false })
-      return { tabId: tab.id, url: tab.url ?? url, title: tab.title ?? '' }
+      if (!waitForLoad) {
+        return { tabId: tab.id, url: tab.url ?? url, title: tab.title ?? '', loaded: false }
+      }
+      const loaded = await waitForTabLoad(tab.id, timeoutMs)
+      const finalTab = await chrome.tabs.get(tab.id).catch(() => tab)
+      return {
+        tabId: tab.id,
+        url: finalTab?.url ?? tab.url ?? url,
+        title: finalTab?.title ?? tab.title ?? '',
+        loaded,
+      }
     }
     case 'tabs.activate': {
       const tabId = requireTabId(params.tabId)
@@ -2705,6 +2722,43 @@ function httpUrl(value) {
     throw new Error('Only HTTP and HTTPS pages can be opened')
   }
   return url.href
+}
+
+/**
+ * Wait for one tab to reach Chrome's 'complete' status, bounded by timeoutMs.
+ * Resolves true on completion and false on timeout or tab removal; it never
+ * throws, so tabs.open can still return whatever tab state is known. Every
+ * listener is removed before resolving.
+ */
+function waitForTabLoad(tabId, timeoutMs) {
+  return new Promise(resolve => {
+    let settled = false
+    let timer
+    const cleanup = () => {
+      if (timer !== undefined) clearTimeout(timer)
+      chrome.tabs.onUpdated.removeListener(onUpdated)
+      chrome.tabs.onRemoved.removeListener(onRemoved)
+    }
+    const finish = loaded => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolve(loaded)
+    }
+    const onUpdated = (updatedTabId, changeInfo) => {
+      if (updatedTabId === tabId && changeInfo?.status === 'complete') finish(true)
+    }
+    const onRemoved = removedTabId => {
+      if (removedTabId === tabId) finish(false)
+    }
+    timer = setTimeout(() => finish(false), timeoutMs)
+    chrome.tabs.onUpdated.addListener(onUpdated)
+    chrome.tabs.onRemoved.addListener(onRemoved)
+    // The tab may already be complete, or gone, when this starts waiting.
+    chrome.tabs.get(tabId).then(tab => {
+      if (tab?.status === 'complete') finish(true)
+    }, () => finish(false))
+  })
 }
 
 function navigateTabAndWait(tabId, url, signal) {
