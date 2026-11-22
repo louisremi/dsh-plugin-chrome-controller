@@ -5152,9 +5152,13 @@ function downloadBelongsToTab(item, state) {
     return state.openedTabs.has(item.tabId) || state.unattributedTabs.has(item.tabId)
   }
   const referrer = typeof item?.referrer === 'string' ? item.referrer : ''
-  if (referrer === '') return false
-  if (state.tabUrl !== '' && referrer === state.tabUrl) return true
-  return state.tabOrigin !== '' && captureSourceOrigin(referrer) === state.tabOrigin
+  if (referrer !== '') {
+    if (state.tabUrl !== '' && referrer === state.tabUrl) return true
+    if (state.tabOrigin !== '' && captureSourceOrigin(referrer) === state.tabOrigin) return true
+  }
+  // Chrome reports a download started by a popup with no tab and no referrer.
+  // When the click opened a popup in this capture window, it is that document.
+  return state.openedTabs.size > 0 || state.unattributedTabs.size > 0
 }
 
 /** A file name Chrome proposed for a download, stripped to its last segment. */
@@ -5217,8 +5221,15 @@ function createCaptureDownloadState({ tabId, tabUrl, tabOrigin, accept }) {
       const url = captureCandidateUrl(item.finalUrl || item.url)
       if (url === undefined) return
       // A download started in a tab the click opened is a window-open capture;
-      // one started in the clicked tab is a plain download.
-      const openedTab = Number.isSafeInteger(item.tabId) && item.tabId >= 0 && item.tabId !== state.tabId
+      // one started in the clicked tab is a plain download. Chrome may leave a
+      // popup download unattributed (tabId -1, no referrer): a popup seen during
+      // the capture window is then the only thing that can have started it.
+      const downloadTabId = Number.isSafeInteger(item.tabId) && item.tabId >= 0 ? item.tabId : undefined
+      const popupSeen = state.openedTabs.size > 0 || state.unattributedTabs.size > 0
+      const openedTab = downloadTabId === undefined
+        ? popupSeen
+        : downloadTabId !== state.tabId
+          && (state.openedTabs.has(downloadTabId) || state.unattributedTabs.has(downloadTabId))
       const suggestedFileName = captureSuggestedFileName(item.filename)
       recordCaptureDownloadCandidate(state, {
         source: 'url',
@@ -5248,6 +5259,29 @@ function createCaptureDownloadState({ tabId, tabUrl, tabOrigin, accept }) {
       if (!state.openedTabs.has(tab.id)) state.openedTabs.set(tab.id, undefined)
     } catch {
       // Ignore a tab event that cannot be read.
+    }
+  }
+  // A popup can navigate and close faster than the poll loop; record its URL
+  // from the tab update while the tab is still there.
+  state.onTabUpdated = (updatedTabId, changeInfo, tab) => {
+    try {
+      if (!Number.isSafeInteger(updatedTabId) || updatedTabId === state.tabId) return
+      if (!state.openedTabs.has(updatedTabId) && !state.unattributedTabs.has(updatedTabId)) return
+      if (state.openedTabs.get(updatedTabId) !== undefined) return
+      const url = captureCandidateUrl(changeInfo?.url)
+        ?? captureCandidateUrl(tab?.url)
+        ?? captureCandidateUrl(tab?.pendingUrl)
+      if (url === undefined) return
+      if (state.openedTabs.has(updatedTabId)) state.openedTabs.set(updatedTabId, { url })
+      recordCaptureDownloadCandidate(state, {
+        source: 'url',
+        via: 'window-open',
+        url,
+        contentType: '',
+        observedAt: Date.now(),
+      })
+    } catch {
+      // Ignore a tab update that cannot be read.
     }
   }
   state.onDebuggerEvent = (source, method, eventParams = {}) => {
@@ -5338,6 +5372,7 @@ async function armCaptureDownloadSources(state, target) {
   state.target = target
   chrome.downloads.onCreated.addListener(state.onDownloadCreated)
   chrome.tabs.onCreated?.addListener(state.onTabCreated)
+  chrome.tabs.onUpdated?.addListener(state.onTabUpdated)
   chrome.debugger.onEvent.addListener(state.onDebuggerEvent)
   try {
     await runInFrame(state.tabId, 0, installCaptureDownloadSpy, [], 'MAIN')
@@ -5357,6 +5392,7 @@ async function armCaptureDownloadSources(state, target) {
 async function disarmCaptureDownloadSources(state) {
   chrome.downloads.onCreated.removeListener(state.onDownloadCreated)
   chrome.tabs.onCreated?.removeListener(state.onTabCreated)
+  chrome.tabs.onUpdated?.removeListener(state.onTabUpdated)
   chrome.debugger.onEvent.removeListener(state.onDebuggerEvent)
   for (const openedTabId of [...state.openedTabs.keys()]) await closeCaptureDownloadTab(openedTabId)
   if (state.spyInstalled) {

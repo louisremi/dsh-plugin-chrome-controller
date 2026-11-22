@@ -276,6 +276,7 @@ describe('capture download wiring', () => {
     for (const marker of [
       "chrome.downloads.onCreated.addListener(state.onDownloadCreated)",
       'chrome.tabs.onCreated?.addListener(state.onTabCreated)',
+      'chrome.tabs.onUpdated?.addListener(state.onTabUpdated)',
       'runInFrame(state.tabId, 0, installCaptureDownloadSpy, [], \'MAIN\')',
       'runInFrame(state.tabId, 0, readCaptureDownloadSpy, [], \'MAIN\')',
       'runInFrame(state.tabId, 0, uninstallCaptureDownloadSpy, [], \'MAIN\')',
@@ -358,7 +359,7 @@ function loadCaptureDownload({ chrome, debuggerCommand, runInFrame, dispatchClic
 
 /** A fake chrome namespace plus the scripting and CDP stubs the capture calls. */
 function createCaptureEnvironment({ click = () => {}, tab = { id: 7, url: 'https://shop.test/page' } } = {}) {
-  const listeners = { downloads: new Set(), tabs: new Set(), debugger: new Set() }
+  const listeners = { downloads: new Set(), tabs: new Set(), tabUpdates: new Set(), debugger: new Set() }
   const calls = { cancelled: [], erased: [], removedTabs: [], commands: [], responseBodies: [] }
   const openedTabs = new Map()
   const environment = {
@@ -381,6 +382,10 @@ function createCaptureEnvironment({ click = () => {}, tab = { id: 7, url: 'https
       onCreated: {
         addListener(listener) { listeners.tabs.add(listener) },
         removeListener(listener) { listeners.tabs.delete(listener) },
+      },
+      onUpdated: {
+        addListener(listener) { listeners.tabUpdates.add(listener) },
+        removeListener(listener) { listeners.tabUpdates.delete(listener) },
       },
       async get(id) {
         if (id === tab.id) return tab
@@ -421,6 +426,9 @@ function createCaptureEnvironment({ click = () => {}, tab = { id: 7, url: 'https
     if (laterTab !== undefined) openedTabs.set(openedTab.id, laterTab)
     for (const listener of listeners.tabs) listener(openedTab)
   }
+  environment.tabUpdated = (tabId, changeInfo, tab) => {
+    for (const listener of listeners.tabUpdates) listener(tabId, changeInfo, tab)
+  }
   environment.debuggerEvent = (method, params) => {
     for (const listener of listeners.debugger) listener({ tabId: tab.id }, method, params)
   }
@@ -428,6 +436,7 @@ function createCaptureEnvironment({ click = () => {}, tab = { id: 7, url: 'https
   environment.listenerCounts = () => ({
     downloads: listeners.downloads.size,
     tabs: listeners.tabs.size,
+    tabUpdates: listeners.tabUpdates.size,
     debugger: listeners.debugger.size,
   })
   environment.api = loadCaptureDownload({
@@ -460,7 +469,7 @@ describe('capture download orchestration', () => {
     assert.equal(result.navigated, false)
     assert.deepEqual(environment.calls.cancelled, [5])
     assert.deepEqual(environment.calls.erased, [5])
-    assert.deepEqual(environment.listenerCounts(), { downloads: 0, tabs: 0, debugger: 0 })
+    assert.deepEqual(environment.listenerCounts(), { downloads: 0, tabs: 0, tabUpdates: 0, debugger: 0 })
     for (const command of ['Network.enable', 'Page.enable', 'Page.disable', 'Network.disable']) {
       assert.ok(environment.calls.commands.includes(command), command)
     }
@@ -579,7 +588,7 @@ describe('capture download orchestration', () => {
     assert.equal(result.sourceOrigin, 'https://docs.test')
     // Closed as soon as its URL was read, and again by the finally for safety.
     assert.deepEqual(environment.calls.removedTabs, [21, 21])
-    assert.deepEqual(environment.listenerCounts(), { downloads: 0, tabs: 0, debugger: 0 })
+    assert.deepEqual(environment.listenerCounts(), { downloads: 0, tabs: 0, tabUpdates: 0, debugger: 0 })
   })
 
   it('reads a page-created blob inside the page and restores the spy', async () => {
@@ -667,6 +676,49 @@ describe('capture download orchestration', () => {
     assert.equal(Buffer.from(result.base64, 'base64').toString(), '%PDF-1.7 page-fetch')
   })
 
+  it('records a popup URL from a tab update before the tab closes', async () => {
+    const environment = createCaptureEnvironment({
+      click: env => {
+        env.tabOpened({ id: 31 })
+        env.tabUpdated(31, { url: 'https://docs.test/getDoc?orderId=7&docId=9' }, { id: 31, url: 'https://docs.test/getDoc?orderId=7&docId=9' })
+      },
+    })
+    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 300 })
+    assert.equal(result.captured, true)
+    assert.equal(result.source, 'url')
+    assert.equal(result.via, 'window-open')
+    assert.equal(result.sourceOrigin, 'https://docs.test')
+  })
+
+  it('attributes an unowned download to a popup the click opened', async () => {
+    const environment = createCaptureEnvironment({
+      click: env => {
+        env.tabOpened({ id: 41 })
+        env.download({
+          id: 42,
+          tabId: -1,
+          referrer: '',
+          url: 'https://docs.test/tax-invoice.pdf',
+          mime: 'application/pdf',
+          filename: 'C:\\Users\\me\\Downloads\\tax invoice.pdf',
+        })
+      },
+    })
+    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 300 })
+    assert.equal(result.captured, true)
+    assert.equal(result.via, 'window-open')
+    assert.equal(result.suggestedFileName, 'tax invoice.pdf')
+    assert.deepEqual(environment.calls.cancelled, [42])
+  })
+
+  it('ignores an unowned download when the click opened no popup', async () => {
+    const environment = createCaptureEnvironment({
+      click: env => env.download({ id: 43, tabId: -1, referrer: '', url: 'https://other.test/unrelated.pdf', mime: 'application/pdf' }),
+    })
+    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 200 })
+    assert.deepEqual(result, { captured: false, reason: 'no file within 200 ms', navigated: false, clicked: true })
+  })
+
   it('disarms every source when the click itself fails', async () => {
     const environment = createCaptureEnvironment({
       click: () => { throw new Error('The selected element is covered at its click point') },
@@ -674,7 +726,7 @@ describe('capture download orchestration', () => {
     await assert.rejects(
       environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 300 }),
       /covered at its click point/u)
-    assert.deepEqual(environment.listenerCounts(), { downloads: 0, tabs: 0, debugger: 0 })
+    assert.deepEqual(environment.listenerCounts(), { downloads: 0, tabs: 0, tabUpdates: 0, debugger: 0 })
     assert.equal(environment.spyUninstalled, true)
     assert.ok(environment.calls.commands.includes('Network.disable'))
   })
