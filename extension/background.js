@@ -2622,7 +2622,13 @@ async function executeBrowserOperationNow(method, params, signal) {
           })
           if (typeof response.data !== 'string') throw new Error('Chrome returned no screenshot data')
           debuggerTargetsNeedingFreshCoordinates.delete(target)
-          return { tabId, data: response.data, mimeType: 'image/png' }
+          const viewport = await readScreenshotViewport(target)
+          return {
+            tabId,
+            data: response.data,
+            mimeType: 'image/png',
+            ...(viewport === undefined ? {} : { viewport }),
+          }
         })
       } finally {
         await sendOverlayControl(tabId, 'DSH_CURSOR_SHOW')
@@ -2631,6 +2637,42 @@ async function executeBrowserOperationNow(method, params, signal) {
     default:
       throw new Error('Unsupported Chrome browser operation: ' + method)
   }
+}
+
+const SCREENSHOT_VIEWPORT_EXPRESSION = '({ width: window.innerWidth, height: window.innerHeight, devicePixelRatio: window.devicePixelRatio })'
+
+/**
+ * Read the CSS-pixel viewport while the debugger is attached, so the plugin can
+ * report how screenshot pixels map to click coordinates. Best-effort: never
+ * fails the screenshot; undefined when neither CDP path answers.
+ */
+async function readScreenshotViewport(target) {
+  try {
+    const response = await debuggerCommand(target, 'Runtime.evaluate', {
+      expression: SCREENSHOT_VIEWPORT_EXPRESSION,
+      returnByValue: true,
+    })
+    const value = response?.result?.value
+    if (isRecord(value) && Number.isFinite(value.width) && Number.isFinite(value.height)) {
+      return {
+        width: value.width,
+        height: value.height,
+        ...(Number.isFinite(value.devicePixelRatio) ? { devicePixelRatio: value.devicePixelRatio } : {}),
+      }
+    }
+  } catch {
+    // Fall back to layout metrics.
+  }
+  try {
+    const metrics = await debuggerCommand(target, 'Page.getLayoutMetrics')
+    const viewport = metrics?.cssLayoutViewport
+    if (isRecord(viewport) && Number.isFinite(viewport.clientWidth) && Number.isFinite(viewport.clientHeight)) {
+      return { width: viewport.clientWidth, height: viewport.clientHeight }
+    }
+  } catch {
+    // No viewport information; the screenshot is still returned.
+  }
+  return undefined
 }
 
 async function getTabs() {
