@@ -2085,20 +2085,40 @@ async function executeBrowserOperationNow(method, params, signal) {
       const maxChars = Number.isInteger(params.maxChars)
         ? Math.max(1, Math.min(MAX_SNAPSHOT_CHARS, params.maxChars))
         : 20_000
+      const maxLinks = Number.isInteger(params.maxLinks)
+        ? Math.max(1, Math.min(100, params.maxLinks))
+        : 100
+      const includeLinks = params.includeLinks !== false
       if (params.frameId !== undefined) {
         const frameId = requireFrameId(params.frameId)
-        const payload = await runInFrame(tabId, frameId, frameSnapshotPayload, [maxChars])
+        const payload = await runInFrame(tabId, frameId, frameSnapshotPayload, [maxChars, maxLinks, includeLinks])
         return {
           tabId,
           frameId,
           ...(isRecord(payload)
             ? payload
-            : { title: '', url: '', text: '', links: [], grid: { cellCount: 0, cells: [], canvasCount: 0, gridRoleCount: 0 } }),
+            : { title: '', url: '', text: '', links: [], totalLinks: 0, linksTruncated: false, grid: { cellCount: 0, cells: [], canvasCount: 0, gridRoleCount: 0 } }),
         }
       }
-      const expression = "(() => ({title: document.title, url: location.href, text: (document.body?.innerText ?? '').slice(0, "
-        + String(maxChars)
-        + "), links: Array.from(document.querySelectorAll('a[href]')).slice(0, 100).map(link => ({text: (link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 240), url: link.href}))}))()"
+      const expression = `(() => {
+        const redact = value => String(value)
+          .replace(/(access_token(?:=|%3D))[^&"'\\s]+/gi, '$1<redacted>')
+          .replace(/(["']access_token["']\\s*:\\s*["'])[^"']+/gi, '$1<redacted>')
+          .replace(/(authorization["']?\\s*[:=]\\s*["']?bearer\\s+)[^"'\\s]+/gi, '$1<redacted>')
+        const anchors = Array.from(document.querySelectorAll('a[href]'))
+        const links = ${includeLinks} ? anchors.slice(0, ${maxLinks}).map(link => ({
+          text: redact(link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 120),
+          url: redact(link.href),
+        })) : []
+        return {
+          title: document.title,
+          url: redact(location.href),
+          text: (document.body?.innerText ?? '').slice(0, ${maxChars}),
+          links,
+          totalLinks: anchors.length,
+          linksTruncated: anchors.length > links.length,
+        }
+      })()`
       return withDebugger(tabId, async target => {
         const response = await debuggerCommand(target, 'Runtime.evaluate', {
           expression,
@@ -2106,7 +2126,7 @@ async function executeBrowserOperationNow(method, params, signal) {
           awaitPromise: true,
         })
         if (response.exceptionDetails !== undefined) throw new Error('The page snapshot could not be read')
-        return response.result?.value ?? { title: '', url: '', text: '', links: [] }
+        return response.result?.value ?? { title: '', url: '', text: '', links: [], totalLinks: 0, linksTruncated: false }
       })
     }
     case 'page.find': {
@@ -3809,15 +3829,17 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
 }
 
 /** Runs inside the target frame: snapshot payload plus a best-effort grid-cell dump. */
-function frameSnapshotPayload(maxChars) {
+function frameSnapshotPayload(maxChars, maxLinks, includeLinks) {
   // Mask common token patterns in returned strings; other secret formats can remain.
   const redact = value => String(value)
     .replace(/(access_token(?:=|%3D))[^&"'\s]+/gi, '$1<redacted>')
     .replace(/(["']access_token["']\s*:\s*["'])[^"']+/gi, '$1<redacted>')
     .replace(/(authorization["']?\s*[:=]\s*["']?bearer\s+)[^"'\s]+/gi, '$1<redacted>')
   const text = redact(document.body?.innerText ?? '').slice(0, maxChars)
-  const links = Array.from(document.querySelectorAll('a[href]')).slice(0, 100).map(link => ({
-    text: redact(link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 240),
+  const limit = Number.isSafeInteger(maxLinks) ? Math.max(1, Math.min(100, maxLinks)) : 100
+  const anchors = Array.from(document.querySelectorAll('a[href]'))
+  const links = includeLinks === false ? [] : anchors.slice(0, limit).map(link => ({
+    text: redact(link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 120),
     url: redact(link.href),
   }))
   const cells = Array.from(document.querySelectorAll('[role="gridcell"],[role="rowheader"],[role="columnheader"],[aria-rowindex]'))
@@ -3870,6 +3892,8 @@ function frameSnapshotPayload(maxChars) {
     url: redact(location.href),
     text,
     links,
+    totalLinks: anchors.length,
+    linksTruncated: anchors.length > links.length,
     inputs,
     usedRange,
     rects,
