@@ -5043,6 +5043,8 @@ function readCaptureDownloadResponseBytes(url) {
   const record = Array.isArray(state.responses) ? state.responses.find(item => item.url === url) : undefined
   if (record === undefined || !(record.buffer instanceof ArrayBuffer)) return { error: 'unavailable' }
   const bytes = new Uint8Array(record.buffer)
+  // Injected page functions cannot call the service worker's encodeBase64Bytes,
+  // so this encodes in place; keep the two loops in sync.
   let binary = ''
   for (let index = 0; index < bytes.length; index += 0x8000) {
     binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000))
@@ -5541,33 +5543,13 @@ async function collectCaptureDownloadCandidates(state) {
   if (state.pendingBodies.size > 0) await Promise.allSettled([...state.pendingBodies])
 }
 
-/** One file can be seen by two sources (an anchor and its download); dedupe by its URL. */
-function captureCandidateKey(candidate) {
-  if (typeof candidate?.url === 'string' && candidate.url !== '') return candidate.url
-  return String(candidate?.via ?? '') + ':' + String(candidate?.contentType ?? '')
-    + ':' + String(candidate?.bytes ?? '')
-}
-
 /** Choose the first acceptable file, and describe the other acceptable files seen. */
 function chooseCapturedDownload(state) {
-  const { selected, also } = selectDownloadCandidate(state.candidates, { accept: state.accept })
-  if (selected === undefined) return undefined
-  const seen = new Set([captureCandidateKey(selected)])
-  const others = []
-  for (const candidate of state.candidates) {
-    if (candidate === selected) continue
-    if (others.length >= MAX_CAPTURE_DOWNLOAD_ALSO) break
-    if (!matchesAccept(candidate, state.accept)) continue
-    const key = captureCandidateKey(candidate)
-    if (seen.has(key)) continue
-    seen.add(key)
-    others.push({
-      via: candidate.via,
-      contentType: typeof candidate.contentType === 'string' ? candidate.contentType : '',
-      ...(Number.isSafeInteger(candidate.bytes) && candidate.bytes >= 0 ? { bytes: candidate.bytes } : {}),
-    })
-  }
-  return { selected, also: others }
+  const choice = selectDownloadCandidate(state.candidates, {
+    accept: state.accept,
+    maxAlso: MAX_CAPTURE_DOWNLOAD_ALSO,
+  })
+  return choice.selected === undefined ? undefined : choice
 }
 
 /** Shape the extension result for the plugin: bytes or a URL, never both, never a page spy. */

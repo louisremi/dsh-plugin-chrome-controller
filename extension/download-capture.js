@@ -92,9 +92,11 @@ export function matchesAccept(candidate, accept) {
  * the first file the click produced wins. Returns `{ selected, also }`:
  * `selected` is the winning candidate or undefined, and `also` describes the
  * other acceptable files seen in the capture window as `{ via, contentType,
- * bytes }` (the bytes count is omitted when unknown).
+ * bytes }` (the bytes count is omitted when unknown). One file can be seen by
+ * two sources (an anchor and its download), so `also` keeps the first candidate
+ * per `keyOf` identity and stops at `maxAlso` entries.
  */
-export function selectDownloadCandidate(candidates, { accept } = {}) {
+export function selectDownloadCandidate(candidates, { accept, maxAlso = 10, keyOf = candidateKey } = {}) {
   const recorded = Array.isArray(candidates) ? candidates : []
   const acceptable = recorded
     .map((candidate, position) => ({
@@ -106,12 +108,25 @@ export function selectDownloadCandidate(candidates, { accept } = {}) {
     .sort((left, right) => left.observedAt - right.observedAt || left.position - right.position)
     .map(entry => entry.candidate)
   const [selected, ...rest] = acceptable
-  return {
-    selected,
-    also: rest.map(candidate => ({
+  const seen = new Set(selected === undefined ? [] : [keyOf(selected)])
+  const also = []
+  for (const candidate of rest) {
+    if (also.length >= maxAlso) break
+    const key = keyOf(candidate)
+    if (seen.has(key)) continue
+    seen.add(key)
+    also.push({
       via: candidate.via,
       contentType: candidate.contentType ?? candidate.mimeType ?? '',
       ...(Number.isSafeInteger(candidate.bytes) && candidate.bytes >= 0 ? { bytes: candidate.bytes } : {}),
-    })),
+    })
   }
+  return { selected, also }
+}
+
+/** Identity of one file, so a URL and the download it triggered count once. */
+export function candidateKey(candidate) {
+  if (typeof candidate?.url === 'string' && candidate.url !== '') return candidate.url
+  return String(candidate?.via ?? '') + ':' + String(candidate?.contentType ?? '')
+    + ':' + String(candidate?.bytes ?? '')
 }

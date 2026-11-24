@@ -75,7 +75,8 @@ describe('selectDownloadCandidate', () => {
     const download = candidate({ via: 'download', url: 'https://shop.test/invoice.pdf', observedAt: 50 })
     const { selected, also } = selectDownloadCandidate([anchor, download])
     assert.equal(selected, anchor)
-    assert.deepEqual(also, [{ via: 'download', contentType: 'application/pdf', bytes: 2_048 }])
+    // The download repeats the anchor's URL, so it is the same file.
+    assert.deepEqual(also, [])
   })
 
   it('honours the accept list and reports the rest as also without bytes when unknown', () => {
@@ -93,6 +94,22 @@ describe('selectDownloadCandidate', () => {
     ])
     assert.equal(windowOpen.selected?.via, 'window-open')
     assert.deepEqual(windowOpen.also, [])
+  })
+
+  it('reports each file once and caps the list at maxAlso', () => {
+    const first = candidate({ observedAt: 10 })
+    const duplicates = Array.from({ length: 5 }, (_, index) => candidate({
+      via: 'download', url: 'https://shop.test/invoices/42.pdf', observedAt: 20 + index,
+    }))
+    const extras = Array.from({ length: 3 }, (_, index) => candidate({
+      via: 'response', contentType: 'image/png', url: 'https://shop.test/' + String(index) + '.png', observedAt: 30 + index,
+    }))
+    const choice = selectDownloadCandidate([first, ...duplicates, ...extras], { maxAlso: 2 })
+    assert.equal(choice.selected, first)
+    assert.deepEqual(choice.also, [
+      { via: 'response', contentType: 'image/png', bytes: 2_048 },
+      { via: 'response', contentType: 'image/png', bytes: 2_048 },
+    ])
   })
 
   it('returns no selected candidate when nothing is acceptable', () => {
@@ -302,7 +319,7 @@ const CAPTURE_FUNCTION_NAMES = [
   'closeCaptureDownloadTab', 'recordCaptureDownloadCandidate', 'createCaptureDownloadState',
   'loadCaptureDownloadResponseBody', 'armCaptureDownloadSources', 'disarmCaptureDownloadSources',
   'collectCaptureDownloadBlobs', 'collectCaptureDownloadBlob', 'collectCaptureDownloadResponse', 'readCaptureDownloadResponseBytes', 'collectCaptureDownloadTabs',
-  'collectCaptureDownloadCandidates', 'captureCandidateKey', 'chooseCapturedDownload',
+  'collectCaptureDownloadCandidates', 'chooseCapturedDownload',
   'capturedDownloadResult', 'captureDownload',
 ]
 

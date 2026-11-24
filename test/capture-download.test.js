@@ -3,85 +3,9 @@ import { createHash } from 'node:crypto'
 import { mkdtemp, readdir, readFile, realpath, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { apply } from '../lib/index.js'
-
-const EXTENSION_ORIGIN = 'chrome-extension://' + 'b'.repeat(32)
-const PAIRING_KEY = 'dsh-plugin-chrome-controller/pairing-code'
-
-/** A plugin context complete enough to apply the whole plugin. */
-function fakePluginContext({ mode = 'workspace-write', root, withServices = true, approvals = [] }) {
-  const routes = new Map()
-  const tools = new Map()
-  const records = new Map()
-  const services = withServices ? {
-    sandboxPolicy: { resolve: () => ({ mode, workspaceRoot: root }) },
-    workingDirectory: { ensure: async () => root },
-    sandbox: { async confine(argv) { return { argv: [...argv], enforcement: 'full', denialSignatures: [], runnerFailureRules: [] } } },
-    approval: {
-      asked: [],
-      async request(request) {
-        this.asked.push(request)
-        return approvals.shift() ?? 'unavailable'
-      },
-    },
-  } : {}
-  const disposers = []
-  return {
-    routes,
-    services,
-    registered: tools,
-    disposers,
-    skills: { register() {} },
-    systemPrompt: { section() {}, getSectionOrder: () => 0 },
-    tools: { register(tool) { tools.set(tool.name, tool) } },
-    webServer: { host: '127.0.0.1', register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path) } },
-    connection: { fetch: { register: () => () => {} }, requestRejection: () => 401 },
-    credentials: {
-      async readRecord(key) { return records.get(key) },
-      async modifyRecord(key, update) {
-        const next = await update(records.get(key))
-        if (next !== undefined) records.set(key, next)
-        return records.get(key)
-      },
-    },
-    on: () => () => {},
-    effect(factory) { disposers.push(factory()) },
-    get: name => services[name],
-  }
-}
-
-async function call(context, path, body) {
-  const request = Readable.from([Buffer.from(JSON.stringify(body))])
-  request.method = 'POST'
-  request.headers = { host: '127.0.0.1:3080', origin: EXTENSION_ORIGIN }
-  request.socket = { remoteAddress: '127.0.0.1' }
-  let text = ''
-  const response = {
-    destroyed: false,
-    writeHead() {},
-    end(chunk) { if (chunk !== undefined) text += String(chunk) },
-    once() {},
-    removeListener() {},
-  }
-  await context.routes.get('/dsh-browser-extension/' + path)(request, response)
-  return text === '' ? undefined : JSON.parse(text)
-}
-
-/** Pair a fake extension, then answer the first command it polls with `reply`. */
-async function pairAndAnswer(context, reply) {
-  const pairingCode = (await context.credentials.readRecord(PAIRING_KEY)).key
-  const { pairToken } = await call(context, 'authorize', { pairingCode })
-  const { sessionToken } = await call(context, 'connect', { pairToken })
-  return async () => {
-    let commands = []
-    while (commands.length === 0) ({ commands } = await call(context, 'poll', { sessionToken }))
-    const [command] = commands
-    await call(context, 'respond', { sessionToken, id: command.id, ok: true, result: reply(command) })
-    return command
-  }
-}
+import { call, fakePluginContext, pairAndAnswer } from './helpers/plugin-harness.js'
 
 const TOOL = 'dsh_browser_capture_download'
 
