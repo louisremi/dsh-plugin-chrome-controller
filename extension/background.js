@@ -5150,7 +5150,7 @@ function downloadBelongsToTab(item, state) {
   if (Number.isInteger(item?.tabId) && item.tabId >= 0) {
     if (item.tabId === state.tabId) return true
     // A document the click opened in a new tab can start the download itself
-    // (Microsoft's window.open popup does), so its tab is ours too.
+    // (a window.open popup does), so its tab is ours too.
     return state.openedTabs.has(item.tabId) || state.unattributedTabs.has(item.tabId)
   }
   const referrer = typeof item?.referrer === 'string' ? item.referrer : ''
@@ -5158,9 +5158,10 @@ function downloadBelongsToTab(item, state) {
     if (state.tabUrl !== '' && referrer === state.tabUrl) return true
     if (state.tabOrigin !== '' && captureSourceOrigin(referrer) === state.tabOrigin) return true
   }
-  // Chrome reports a download started by a popup with no tab and no referrer.
-  // When the click opened a popup in this capture window, it is that document.
-  return state.openedTabs.size > 0 || state.unattributedTabs.size > 0
+  // Chrome reports some popup downloads as unowned (no tabId, no referrer).
+  // Those cannot be told apart from a download the user started, and erasing
+  // one would destroy a file the capture never saves, so ignore them.
+  return false
 }
 
 /** A file name Chrome proposed for a download, stripped to its last segment. */
@@ -5219,19 +5220,17 @@ function createCaptureDownloadState({ tabId, tabUrl, tabOrigin, accept }) {
   state.onDownloadCreated = item => {
     try {
       if (!isRecord(item) || !downloadBelongsToTab(item, state)) return
-      if (Number.isSafeInteger(item.id)) state.pendingDiscards.add(discardChromeDownload(item.id))
       const url = captureCandidateUrl(item.finalUrl || item.url)
-      if (url === undefined) return
+      const contentType = typeof item.mime === 'string' ? item.mime : ''
+      // A download the capture cannot fetch (data:, file:) or has not accepted
+      // is left to Chrome: cancelling it would erase the user's file while
+      // nothing is saved in its place.
+      if (url === undefined || !matchesAccept({ url, contentType }, state.accept)) return
+      if (Number.isSafeInteger(item.id)) state.pendingDiscards.add(discardChromeDownload(item.id))
       // A download started in a tab the click opened is a window-open capture;
-      // one started in the clicked tab is a plain download. Chrome may leave a
-      // popup download unattributed (tabId -1, no referrer): a popup seen during
-      // the capture window is then the only thing that can have started it.
+      // one started in the clicked tab (or by its referrer) is a plain download.
       const downloadTabId = Number.isSafeInteger(item.tabId) && item.tabId >= 0 ? item.tabId : undefined
-      const popupSeen = state.openedTabs.size > 0 || state.unattributedTabs.size > 0
-      const openedTab = downloadTabId === undefined
-        ? popupSeen
-        : downloadTabId !== state.tabId
-          && (state.openedTabs.has(downloadTabId) || state.unattributedTabs.has(downloadTabId))
+      const openedTab = downloadTabId !== undefined && downloadTabId !== state.tabId
       const suggestedFileName = captureSuggestedFileName(item.filename)
       recordCaptureDownloadCandidate(state, {
         source: 'url',

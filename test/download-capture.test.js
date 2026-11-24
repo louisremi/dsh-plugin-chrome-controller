@@ -707,7 +707,7 @@ describe('capture download orchestration', () => {
     assert.equal(result.sourceOrigin, 'https://docs.test')
   })
 
-  it('attributes an unowned download to a popup the click opened', async () => {
+  it('ignores an unowned download even when the click opened a popup', async () => {
     const environment = createCaptureEnvironment({
       click: env => {
         env.tabOpened({ id: 41 })
@@ -721,11 +721,38 @@ describe('capture download orchestration', () => {
         })
       },
     })
-    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 300 })
-    assert.equal(result.captured, true)
-    assert.equal(result.via, 'window-open')
-    assert.equal(result.suggestedFileName, 'tax invoice.pdf')
-    assert.deepEqual(environment.calls.cancelled, [42])
+    // An unowned download cannot be told apart from the user's own, so it is
+    // neither saved nor erased.
+    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 200 })
+    assert.equal(result.captured, false)
+    assert.deepEqual(environment.calls.cancelled, [])
+    assert.deepEqual(environment.calls.erased, [])
+  })
+
+  it('leaves a download it cannot fetch (data: URL) to Chrome instead of erasing it', async () => {
+    const environment = createCaptureEnvironment({
+      click: env => env.download({
+        id: 44, tabId: 7, url: 'data:application/pdf;base64,JVBERi0xLjQK', mime: 'application/pdf',
+      }),
+    })
+    const result = await environment.api.captureDownload({ tabId: 7, selector: '#download', timeoutMs: 200 })
+    assert.equal(result.captured, false)
+    assert.deepEqual(environment.calls.cancelled, [])
+    assert.deepEqual(environment.calls.erased, [])
+  })
+
+  it('leaves a download the accept list rejects to Chrome instead of erasing it', async () => {
+    const environment = createCaptureEnvironment({
+      click: env => env.download({
+        id: 45, tabId: 7, url: 'https://shop.test/invoices/42.pdf', mime: 'application/pdf',
+      }),
+    })
+    const result = await environment.api.captureDownload({
+      tabId: 7, selector: '#download', accept: ['.zip'], timeoutMs: 200,
+    })
+    assert.equal(result.captured, false)
+    assert.deepEqual(environment.calls.cancelled, [])
+    assert.deepEqual(environment.calls.erased, [])
   })
 
   it('ignores an unowned download when the click opened no popup', async () => {

@@ -207,7 +207,7 @@ describe('dsh_browser_capture_download', () => {
     // The extension reported no sourceOrigin for this URL, so the fetched final URL's origin is used.
     assert.equal(result.sourceOrigin, 'https://docs.test')
     assert.equal(result.relativePath, '.tmp/downloads/invoice-42.pdf')
-    assert.equal(result.also, undefined)
+    assert.deepEqual(result.also, [])
     const serialized = JSON.stringify(result)
     for (const secret of ['token=abc', 'getDoc', 'finalUrl', 'blob:']) {
       assert.ok(!serialized.includes(secret), 'the result must not contain ' + secret)
