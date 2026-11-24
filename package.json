@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-chrome-controller",
-  "version": "0.1.70",
+  "version": "0.1.71",
   "private": true,
   "description": "Use a paired Chrome extension as DeepSeek Harness browser tools",
   "type": "module",
