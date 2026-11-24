@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, it } from 'node:test'
 import { apply } from '../lib/index.js'
+import { call, fakePluginContext, pairAndAnswer } from './helpers/plugin-harness.js'
 
 // The service worker registers Chrome listeners at load, so it cannot be
 // imported here. waitForTabLoad is self-contained, so its source can be
@@ -78,75 +78,13 @@ describe('extension waitForTabLoad', () => {
   })
 })
 
-const EXTENSION_ORIGIN = 'chrome-extension://' + 'c'.repeat(32)
-const PAIRING_KEY = 'dsh-plugin-chrome-controller/pairing-code'
-
-/** A plugin context complete enough to pair and call the tabs tool. */
-function fakePluginContext(root) {
-  const routes = new Map()
-  const tools = new Map()
-  const records = new Map()
-  const disposers = []
-  return {
-    routes,
-    registered: tools,
-    disposers,
-    skills: { register() {} },
-    systemPrompt: { section() {}, getSectionOrder: () => 0 },
-    tools: { register(tool) { tools.set(tool.name, tool) } },
-    webServer: { host: '127.0.0.1', register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path) } },
-    connection: { fetch: { register: () => () => {} }, requestRejection: () => 401 },
-    credentials: {
-      async readRecord(key) { return records.get(key) },
-      async modifyRecord(key, update) {
-        const next = await update(records.get(key))
-        if (next !== undefined) records.set(key, next)
-        return records.get(key)
-      },
-    },
-    on: () => () => {},
-    effect(factory) { disposers.push(factory()) },
-    get: name => ({ sandboxPolicy: { resolve: () => ({ mode: 'workspace-write', workspaceRoot: root }) } })[name],
-  }
-}
-
-async function call(context, path, body) {
-  const request = Readable.from([Buffer.from(JSON.stringify(body))])
-  request.method = 'POST'
-  request.headers = { host: '127.0.0.1:3080', origin: EXTENSION_ORIGIN }
-  request.socket = { remoteAddress: '127.0.0.1' }
-  let text = ''
-  const response = {
-    destroyed: false,
-    writeHead() {},
-    end(chunk) { if (chunk !== undefined) text += String(chunk) },
-    once() {},
-    removeListener() {},
-  }
-  await context.routes.get('/dsh-browser-extension/' + path)(request, response)
-  return text === '' ? undefined : JSON.parse(text)
-}
-
-/** Pair a fake extension, then answer the next command with `reply`. */
-async function pairAndAnswer(context, reply) {
-  const pairingCode = (await context.credentials.readRecord(PAIRING_KEY)).key
-  const { pairToken } = await call(context, 'authorize', { pairingCode })
-  const { sessionToken } = await call(context, 'connect', { pairToken })
-  return async () => {
-    let commands = []
-    while (commands.length === 0) ({ commands } = await call(context, 'poll', { sessionToken }))
-    const [command] = commands
-    await call(context, 'respond', { sessionToken, id: command.id, ok: true, result: reply(command) })
-    return command
-  }
-}
 
 describe('dsh_browser_tabs open', () => {
   let context
   const exec = () => ({ name: 'dsh_browser_tabs', callId: 'call-1', agent: { session: { header: { cwd: '/tmp' } } }, signal: new AbortController().signal })
 
   beforeEach(async () => {
-    context = fakePluginContext('/tmp')
+    context = fakePluginContext({ root: '/tmp' })
     await apply(context)
   })
 
