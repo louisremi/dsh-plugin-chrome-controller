@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { Readable } from 'node:stream'
 import { afterEach, beforeEach, describe, it } from 'node:test'
+import { TOKEN_MASK_REPLACEMENT, TOKEN_MASK_RULES } from '../extension/evaluation-sanitize.js'
 import { apply } from '../lib/index.js'
+import { call, fakePluginContext, pairAndAnswer } from './helpers/plugin-harness.js'
 
 // The service worker registers Chrome listeners at load, so it cannot be
 // imported here. frameSnapshotPayload is injected into frames as a
@@ -34,7 +35,9 @@ const LONG_TEXT = 'x'.repeat(200)
 
 describe('frameSnapshotPayload behavior', () => {
   const run = (anchors, maxChars, maxLinks, includeLinks) => {
-    return loadFrameSnapshotPayload(fakeFrame({ anchors }))(maxChars, maxLinks, includeLinks)
+    return loadFrameSnapshotPayload(fakeFrame({ anchors }))(
+    maxChars, maxLinks, includeLinks, TOKEN_MASK_RULES, TOKEN_MASK_REPLACEMENT,
+  )
   }
 
   it('caps links at maxLinks, trims text, and reports totalLinks and linksTruncated', () => {
@@ -67,8 +70,9 @@ describe('frameSnapshotPayload behavior', () => {
     )
   })
 
-  it('masks sensitive query keys in the main-frame snapshot expression too', () => {
-    assert.match(source, /\(\[\?&\]\(\?:token\|key\|secret\|password/u)
+  it('masks with the shared token rules instead of restating them', () => {
+    assert.match(source, /JSON\.stringify\(TOKEN_MASK_RULES\)/u)
+    assert.doesNotMatch(source, /\(\?:token\|key\|secret/u)
   })
 
   it('returns an empty links array with the total still reported when includeLinks is false', () => {
@@ -89,68 +93,6 @@ describe('frameSnapshotPayload behavior', () => {
   })
 })
 
-const EXTENSION_ORIGIN = 'chrome-extension://' + 'd'.repeat(32)
-const PAIRING_KEY = 'dsh-plugin-chrome-controller/pairing-code'
-
-/** A plugin context complete enough to pair and call the snapshot tool. */
-function fakePluginContext() {
-  const routes = new Map()
-  const tools = new Map()
-  const records = new Map()
-  const disposers = []
-  return {
-    routes,
-    registered: tools,
-    disposers,
-    skills: { register() {} },
-    systemPrompt: { section() {}, getSectionOrder: () => 0 },
-    tools: { register(tool) { tools.set(tool.name, tool) } },
-    webServer: { host: '127.0.0.1', register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path) } },
-    connection: { fetch: { register: () => () => {} }, requestRejection: () => 401 },
-    credentials: {
-      async readRecord(key) { return records.get(key) },
-      async modifyRecord(key, update) {
-        const next = await update(records.get(key))
-        if (next !== undefined) records.set(key, next)
-        return records.get(key)
-      },
-    },
-    on: () => () => {},
-    effect(factory) { disposers.push(factory()) },
-    get: () => undefined,
-  }
-}
-
-async function call(context, path, body) {
-  const request = Readable.from([Buffer.from(JSON.stringify(body))])
-  request.method = 'POST'
-  request.headers = { host: '127.0.0.1:3080', origin: EXTENSION_ORIGIN }
-  request.socket = { remoteAddress: '127.0.0.1' }
-  let text = ''
-  const response = {
-    destroyed: false,
-    writeHead() {},
-    end(chunk) { if (chunk !== undefined) text += String(chunk) },
-    once() {},
-    removeListener() {},
-  }
-  await context.routes.get('/dsh-browser-extension/' + path)(request, response)
-  return text === '' ? undefined : JSON.parse(text)
-}
-
-/** Pair a fake extension, then answer the next command with `reply`. */
-async function pairAndAnswer(context, reply) {
-  const pairingCode = (await context.credentials.readRecord(PAIRING_KEY)).key
-  const { pairToken } = await call(context, 'authorize', { pairingCode })
-  const { sessionToken } = await call(context, 'connect', { pairToken })
-  return async () => {
-    let commands = []
-    while (commands.length === 0) ({ commands } = await call(context, 'poll', { sessionToken }))
-    const [command] = commands
-    await call(context, 'respond', { sessionToken, id: command.id, ok: true, result: reply(command) })
-    return command
-  }
-}
 
 const SNAPSHOT_REPLY = { title: 'Billing', url: 'https://shop.test/', text: 'hi', links: [], totalLinks: 0, linksTruncated: false }
 

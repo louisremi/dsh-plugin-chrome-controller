@@ -1,7 +1,9 @@
 import { matchesAccept, selectDownloadCandidate } from './download-capture.js'
 import { MAX_TEXT_CHARS, MAX_XPATH_CHARS, normalizeText, selectElementTarget } from './element-target.js'
 import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
-import { SENSITIVE_QUERY_KEY, elideDataUrl, sanitizeEvaluationValue } from './evaluation-sanitize.js'
+import {
+  SENSITIVE_QUERY_KEY, TOKEN_MASK_REPLACEMENT, TOKEN_MASK_RULES, elideDataUrl, sanitizeEvaluationValue,
+} from './evaluation-sanitize.js'
 
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
 const CONNECT_PATH = '/dsh-browser-extension/connect'
@@ -2091,7 +2093,9 @@ async function executeBrowserOperationNow(method, params, signal) {
       const includeLinks = params.includeLinks !== false
       if (params.frameId !== undefined) {
         const frameId = requireFrameId(params.frameId)
-        const payload = await runInFrame(tabId, frameId, frameSnapshotPayload, [maxChars, maxLinks, includeLinks])
+        const payload = await runInFrame(tabId, frameId, frameSnapshotPayload, [
+          maxChars, maxLinks, includeLinks, TOKEN_MASK_RULES, TOKEN_MASK_REPLACEMENT,
+        ])
         return {
           tabId,
           frameId,
@@ -2101,12 +2105,12 @@ async function executeBrowserOperationNow(method, params, signal) {
         }
       }
       const expression = `(() => {
-        const redact = value => String(value)
-          .replace(/(access_token(?:=|%3D))[^&"'\\s]+/gi, '$1<redacted>')
-          .replace(/(["']access_token["']\\s*:\\s*["'])[^"']+/gi, '$1<redacted>')
-          .replace(/(authorization["']?\\s*[:=]\\s*["']?bearer\\s+)[^"'\\s]+/gi, '$1<redacted>')
-          // The same sensitive query keys dsh_browser_evaluate masks.
-          .replace(/([?&](?:token|key|secret|password|passwd|auth|session|signature|credential|expires|cookie|csrf)=)[^&#\\s"'<>]+/gi, '$1<redacted>')
+        const maskRules = ${JSON.stringify(TOKEN_MASK_RULES)}
+        const maskReplacement = ${JSON.stringify(TOKEN_MASK_REPLACEMENT)}
+        const redact = value => maskRules.reduce(
+          (text, [source, flags]) => text.replace(new RegExp(source, flags), maskReplacement),
+          String(value),
+        )
         const anchors = Array.from(document.querySelectorAll('a[href]'))
         const links = ${includeLinks} ? anchors.slice(0, ${maxLinks}).map(link => ({
           text: redact(link.innerText || link.getAttribute('aria-label') || '').trim().slice(0, 120),
@@ -3831,14 +3835,15 @@ function startElementNoteView({ mode, token, notes, lifetimeMs, corner = 'top-ri
 }
 
 /** Runs inside the target frame: snapshot payload plus a best-effort grid-cell dump. */
-function frameSnapshotPayload(maxChars, maxLinks, includeLinks) {
-  // Mask common token patterns in returned strings; other secret formats can remain.
-  const redact = value => String(value)
-    .replace(/(access_token(?:=|%3D))[^&"'\s]+/gi, '$1<redacted>')
-    .replace(/(["']access_token["']\s*:\s*["'])[^"']+/gi, '$1<redacted>')
-    .replace(/(authorization["']?\s*[:=]\s*["']?bearer\s+)[^"'\s]+/gi, '$1<redacted>')
-    // The same sensitive query keys dsh_browser_evaluate masks.
-    .replace(/([?&](?:token|key|secret|password|passwd|auth|session|signature|credential|expires|cookie|csrf)=)[^&#\s"'<>]+/gi, '$1<redacted>')
+function frameSnapshotPayload(maxChars, maxLinks, includeLinks, maskRules, maskReplacement) {
+  // Injected functions cannot import, so the caller passes the same token mask
+  // rules dsh_browser_evaluate uses.
+  const rules = Array.isArray(maskRules) ? maskRules : []
+  const replacement = typeof maskReplacement === 'string' ? maskReplacement : '$1<redacted>'
+  const redact = value => rules.reduce(
+    (text, [source, flags]) => text.replace(new RegExp(source, flags), replacement),
+    String(value),
+  )
   const text = redact(document.body?.innerText ?? '').slice(0, maxChars)
   const limit = Number.isSafeInteger(maxLinks) ? Math.max(1, Math.min(100, maxLinks)) : 100
   const anchors = Array.from(document.querySelectorAll('a[href]'))
