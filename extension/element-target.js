@@ -27,9 +27,10 @@ export function isInteractive(candidate) {
  *
  * `candidates` are page-side descriptors in document order; `text` is present
  * for a text target and absent for an XPath target. For text, the list is
- * ranked: the innermost match first (one whose text is not also matched by a
- * visible descendant), then interactive controls, so ancestors that merely
- * contain the text come last. `index` picks an entry of that visible candidate
+ * ranked: an interactive control first, then the innermost match (one whose
+ * text is not also matched by a visible descendant), so a wrapper that merely
+ * contains the text comes last and an inner non-interactive span does not hide
+ * the button around it. `index` picks an entry of that visible candidate
  * list, which is the escape hatch when several elements match.
  *
  * Returns { selected, candidates, index } where `candidates` are the visible
@@ -63,19 +64,21 @@ export function selectElementTarget(candidates, { text, index, matchCount } = {}
   throw ambiguousError(ordered.length, label, ordered)
 }
 
-/** Innermost text matches first, then interactive controls; stable otherwise. */
+/** Interactive controls first, then innermost text matches; stable otherwise. */
 function rankTextCandidates(visible) {
   return [...visible].sort((left, right) => rankKey(left) - rankKey(right))
 }
 
 /**
- * Lower is better: an innermost text match first (no other match is its
- * descendant), then an interactive control. Ties keep document order.
+ * Lower is better: an interactive control first, then the innermost match (one
+ * that is not also matched by a visible descendant). Ties keep document order.
+ * This ordering is what makes a button win over a pointer-events:none span it
+ * contains: the span is not itself interactive, so the button outranks it.
  */
 function rankKey(candidate) {
-  const innermost = candidate.hasMatchingDescendant === true ? 1 : 0
   const interactive = isInteractive(candidate) ? 0 : 1
-  return innermost * 2 + interactive
+  const innermost = candidate.hasMatchingDescendant === true ? 1 : 0
+  return interactive * 2 + innermost
 }
 
 function describeTarget(kind, text) {

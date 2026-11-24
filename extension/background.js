@@ -804,8 +804,9 @@ function collectTargetCandidates(query) {
       tagName: entry.element.tagName.toLowerCase(),
       role: entry.element.getAttribute('role'),
       text: collapse(renderedText(entry.element)).slice(0, 300),
-      interactive: entry.element.closest(INTERACTIVE_SELECTOR) !== null
-        || entry.element.querySelector(INTERACTIVE_SELECTOR) !== null,
+      // Whether this element is itself a control, not merely inside or around
+      // one: the ranking prefers the control, so a span inside a button loses.
+      interactive: entry.element.matches(INTERACTIVE_SELECTOR),
       visible: entry.visible,
       bounds: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
       center: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },

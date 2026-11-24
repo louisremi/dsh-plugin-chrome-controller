@@ -58,9 +58,23 @@ describe('selectElementTarget', () => {
     assert.equal(selected, second)
   })
 
-  it('chooses the inner match when a text target matches nested elements', () => {
-    const outer = candidate({ tagName: 'a', interactive: true, hasMatchingDescendant: true, xpath: '/html/body/a[1]' })
+  it('prefers an interactive control over a non-interactive match inside it', () => {
+    const link = candidate({ tagName: 'a', interactive: true, hasMatchingDescendant: true, xpath: '/html/body/a[1]' })
     const inner = candidate({ tagName: 'span', interactive: false, hasMatchingDescendant: false, xpath: '/html/body/a[1]/span[1]' })
+    const { selected } = selectElementTarget([link, inner], { text: 'Download' })
+    assert.equal(selected, link)
+  })
+
+  it('selects a button over a pointer-events:none span it contains', () => {
+    const button = candidate({ tagName: 'button', interactive: true, hasMatchingDescendant: true, xpath: '/html/body/button[1]' })
+    const span = candidate({ tagName: 'span', interactive: false, hasMatchingDescendant: false, xpath: '/html/body/button[1]/span[1]' })
+    const { selected } = selectElementTarget([button, span], { text: 'Télécharger la facture' })
+    assert.equal(selected, button)
+  })
+
+  it('keeps the innermost match when no candidate is interactive', () => {
+    const outer = candidate({ tagName: 'div', interactive: false, hasMatchingDescendant: true, xpath: '/html/body/div[1]' })
+    const inner = candidate({ tagName: 'span', interactive: false, hasMatchingDescendant: false, xpath: '/html/body/div[1]/span[1]' })
     const { selected } = selectElementTarget([outer, inner], { text: 'Download' })
     assert.equal(selected, inner)
   })
