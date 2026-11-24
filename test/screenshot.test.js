@@ -21,9 +21,7 @@ function pngHeader(width, height, { chunkType = 'IHDR', chunkLength = 13 } = {})
 
 describe('pngDimensions', () => {
   it('reads the real pixel size from a valid 1×1 PNG', () => {
-    assert.deepEqual(pngDimensions(ONE_PIXEL_PNG), {
-      width: 1, height: 1, byteLength: Buffer.from(ONE_PIXEL_PNG, 'base64').length, mimeType: 'image/png',
-    })
+    assert.deepEqual(pngDimensions(ONE_PIXEL_PNG), { width: 1, height: 1 })
   })
 
   it('reads the width and height from a base64 PNG header fixture', () => {
