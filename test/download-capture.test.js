@@ -236,6 +236,27 @@ describe('capture download spy', () => {
     assert.deepEqual(spy.readCaptureDownloadResponseBytes('https://shop.test/invoice.pdf'), { error: 'unavailable' })
   })
 
+  it('caps the total response bytes the page keeps, like the debugger source', async () => {
+    const spy = loadCaptureSpy()
+    const chunk = new Uint8Array(8 * 1024 * 1024)
+    chunk.set([0x25, 0x50, 0x44, 0x46]) // %PDF
+    spy.page.fetch = async () => ({
+      ok: true,
+      type: 'basic',
+      url: 'https://shop.test/big.pdf',
+      headers: { get: () => 'application/pdf' },
+      clone: () => ({ arrayBuffer: async () => chunk.buffer }),
+    })
+    spy.installCaptureDownloadSpy()
+    for (let index = 0; index < 3; index++) await spy.page.fetch('https://shop.test/big.pdf', {})
+    await new Promise(resolve => setTimeout(resolve, 0))
+    const responses = spy.readCaptureDownloadSpy().responses
+    // 8 MB + 8 MB fits the 20 MB budget; the third 8 MB body is not retained.
+    assert.equal(responses.length, 2)
+    assert.equal(responses.reduce((total, record) => total + record.size, 0), 16 * 1024 * 1024)
+    spy.uninstallCaptureDownloadSpy()
+  })
+
   it('records XHR response bodies, and ignores HTML/JSON responses', async () => {
     const spy = loadCaptureSpy()
     spy.installCaptureDownloadSpy()

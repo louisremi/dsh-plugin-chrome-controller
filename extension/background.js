@@ -4899,6 +4899,9 @@ function installCaptureDownloadSpy() {
   const MAX_RECORDS = 20
   const MAX_RESPONSES = 8
   const MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+  // The debugger source budgets 20 MB for response bodies; keep the page copy
+  // under the same budget so one click cannot pin 8 x 10 MB in the tab.
+  const MAX_RECORDED_RESPONSE_BYTES = 20 * 1024 * 1024
   const previous = globalThis[KEY]
   if (previous !== undefined && previous.active === true) {
     try { URL.createObjectURL = previous.originalCreateObjectURL } catch {}
@@ -4913,6 +4916,7 @@ function installCaptureDownloadSpy() {
     blobs: [],
     anchors: [],
     responses: [],
+    recordedResponseBytes: 0,
     installedAt: Date.now(),
     originalCreateObjectURL: URL.createObjectURL,
     originalAnchorClick: HTMLAnchorElement.prototype.click,
@@ -4930,6 +4934,7 @@ function installCaptureDownloadSpy() {
       if (!(buffer instanceof ArrayBuffer)) return
       const size = buffer.byteLength
       if (size === 0 || size > MAX_RESPONSE_BYTES) return
+      if (state.recordedResponseBytes + size > MAX_RECORDED_RESPONSE_BYTES) return
       const mime = String(type ?? '').split(';')[0].trim().toLowerCase()
       if (mime === 'text/html' || mime === 'application/xhtml+xml' || mime === 'text/css'
         || mime === 'application/json' || mime.endsWith('+json')
@@ -4937,6 +4942,7 @@ function installCaptureDownloadSpy() {
       const text = String(url ?? '')
       if (text === '' || text.startsWith('blob:')) return
       state.responses.push({ url: text, type: String(type ?? ''), size, buffer, at: Date.now() })
+      state.recordedResponseBytes += size
     } catch {
       // Recording is best-effort; the page's request still runs.
     }
