@@ -1,8 +1,9 @@
 import assert from 'node:assert/strict'
 import { readFile } from 'node:fs/promises'
-import { Readable } from 'node:stream'
 import { describe, it } from 'node:test'
+import { SENSITIVE_QUERY_KEY, elideDataUrl } from '../extension/evaluation-sanitize.js'
 import { apply } from '../lib/index.js'
+import { call, fakePluginContext, pairAndAnswer } from './helpers/plugin-harness.js'
 
 // The service worker registers Chrome listeners at load, so it cannot be
 // imported here. The network helpers are pure, so their source can be
@@ -18,7 +19,11 @@ function loadNetworkHelpers() {
     ...['isRecord', 'redactNetworkUrl', 'redactNetworkPath', 'redactNetworkHeaders', 'filterNetworkRequests'].map(extractFunction),
     'return { redactNetworkUrl, redactNetworkPath, redactNetworkHeaders, filterNetworkRequests }',
   ].join('\n')
-  return new Function(body)()
+  return new Function('elideDataUrl', 'SENSITIVE_QUERY_KEY_PATTERN', 'SENSITIVE_HEADER_PATTERN', body)(
+    elideDataUrl,
+    new RegExp('(?:' + SENSITIVE_QUERY_KEY + ')', 'iu'),
+    new RegExp('(?:' + SENSITIVE_QUERY_KEY + '|proxy-auth)', 'iu'),
+  )
 }
 const { redactNetworkUrl, redactNetworkPath, redactNetworkHeaders, filterNetworkRequests } = loadNetworkHelpers()
 
@@ -38,6 +43,14 @@ describe('redactNetworkUrl', () => {
     assert.equal(redactNetworkUrl(plain), 'data:text/plain,…[' + String(plain.length) + ' chars elided]')
     const bare = 'data:;base64,AAAA'
     assert.equal(redactNetworkUrl(bare), 'data:application/octet-stream;base64,…[' + String(bare.length) + ' chars elided]')
+  })
+
+  it('redacts every key in the shared sensitive list, including expires', () => {
+    const url = 'https://shop.test/x?expires=1&csrf=2&cookie=3&id=4'
+    assert.equal(
+      redactNetworkUrl(url),
+      'https://shop.test/x?expires=%5BREDACTED%5D&csrf=%5BREDACTED%5D&cookie=%5BREDACTED%5D&id=4',
+    )
   })
 
   it('still redacts sensitive query values by default, and only slices when opted in', () => {
@@ -200,68 +213,6 @@ describe('filterNetworkRequests', () => {
   })
 })
 
-const EXTENSION_ORIGIN = 'chrome-extension://' + 'b'.repeat(32)
-const PAIRING_KEY = 'dsh-plugin-chrome-controller/pairing-code'
-
-/** A plugin context complete enough to apply the plugin and pair a fake extension. */
-function fakePluginContext() {
-  const routes = new Map()
-  const tools = new Map()
-  const records = new Map()
-  const disposers = []
-  return {
-    routes,
-    registered: tools,
-    disposers,
-    skills: { register() {} },
-    systemPrompt: { section() {}, getSectionOrder: () => 0 },
-    tools: { register(tool) { tools.set(tool.name, tool) } },
-    webServer: { host: '127.0.0.1', register(route) { routes.set(route.path, route.handler); return () => routes.delete(route.path) } },
-    connection: { fetch: { register: () => () => {} }, requestRejection: () => 401 },
-    credentials: {
-      async readRecord(key) { return records.get(key) },
-      async modifyRecord(key, update) {
-        const next = await update(records.get(key))
-        if (next !== undefined) records.set(key, next)
-        return records.get(key)
-      },
-    },
-    on: () => () => {},
-    effect(factory) { disposers.push(factory()) },
-    get: () => undefined,
-  }
-}
-
-async function callRoute(context, path, body) {
-  const request = Readable.from([Buffer.from(JSON.stringify(body))])
-  request.method = 'POST'
-  request.headers = { host: '127.0.0.1:3080', origin: EXTENSION_ORIGIN }
-  request.socket = { remoteAddress: '127.0.0.1' }
-  let text = ''
-  const response = {
-    destroyed: false,
-    writeHead() {},
-    end(chunk) { if (chunk !== undefined) text += String(chunk) },
-    once() {},
-    removeListener() {},
-  }
-  await context.routes.get('/dsh-browser-extension/' + path)(request, response)
-  return text === '' ? undefined : JSON.parse(text)
-}
-
-/** Pair a fake extension, then answer the first command it polls with `reply`. */
-async function pairAndAnswer(context, reply) {
-  const pairingCode = (await context.credentials.readRecord(PAIRING_KEY)).key
-  const { pairToken } = await callRoute(context, 'authorize', { pairingCode })
-  const { sessionToken } = await callRoute(context, 'connect', { pairToken })
-  return async () => {
-    let commands = []
-    while (commands.length === 0) ({ commands } = await callRoute(context, 'poll', { sessionToken }))
-    const [command] = commands
-    await callRoute(context, 'respond', { sessionToken, id: command.id, ok: true, result: reply(command) })
-    return command
-  }
-}
 
 describe('dsh_browser_network parameters', () => {
   const exec = () => ({ signal: new AbortController().signal })

@@ -1,5 +1,5 @@
 import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
-import { sanitizeEvaluationValue } from './evaluation-sanitize.js'
+import { SENSITIVE_QUERY_KEY, elideDataUrl, sanitizeEvaluationValue } from './evaluation-sanitize.js'
 
 const AUTHORIZE_PATH = '/dsh-browser-extension/authorize'
 const CONNECT_PATH = '/dsh-browser-extension/connect'
@@ -128,6 +128,10 @@ const MAX_FETCH_FILE_BYTES = 10 * 1024 * 1024
 // within this window, and each token is good for one fetch of one URL.
 const FETCH_RETRY_TOKEN_TTL_MS = 5 * 60_000
 const MAX_FETCH_RETRY_TOKENS = 20
+// One canonical key list (evaluation-sanitize.js) drives query and header
+// redaction here too, so a new sensitive key cannot drift between tools.
+const SENSITIVE_QUERY_KEY_PATTERN = new RegExp('(?:' + SENSITIVE_QUERY_KEY + ')', 'iu')
+const SENSITIVE_HEADER_PATTERN = new RegExp('(?:' + SENSITIVE_QUERY_KEY + '|proxy-auth)', 'iu')
 const fetchRetryTokens = new Map()
 
 let activeSession
@@ -4542,24 +4546,16 @@ async function captureNetwork(params, signal) {
 
 function redactNetworkUrl(value, includeSensitiveData = false) {
   const text = String(value)
-  // A data: URL carries file bytes; always replace it with a compact
-  // placeholder, even when the caller asked for sensitive data.
-  if (/^data:/iu.test(text)) {
-    const header = /^data:([^,]*),/iu.exec(text)
-    const metadata = header === null ? '' : header[1]
-    const base64 = /(?:^|;)base64(?:;|$)/iu.test(metadata)
-    const mime = /^([^;]+)/u.exec(metadata)?.[1]?.trim() || (base64 ? 'application/octet-stream' : 'data')
-    return 'data:' + mime + (base64 ? ';base64,' : ',') + '…[' + String(text.length) + ' chars elided]'
-  }
+  // A data: URL carries file bytes; always replace it with the same compact
+  // placeholder evaluation results use, even when sensitive data was asked for.
+  if (/^data:/iu.test(text)) return elideDataUrl(text)
   try {
     const url = new URL(text)
     if (includeSensitiveData) return url.href.slice(0, 2_048)
     url.username = ''
     url.password = ''
     for (const key of [...url.searchParams.keys()]) {
-      if (/token|key|secret|password|passwd|auth|session|cookie|csrf|signature|credential|email/i.test(key)) {
-        url.searchParams.set(key, '[REDACTED]')
-      }
+      if (SENSITIVE_QUERY_KEY_PATTERN.test(key)) url.searchParams.set(key, '[REDACTED]')
     }
     if (url.hash) url.hash = '#[REDACTED]'
     return url.href.slice(0, 2_048)
@@ -4577,7 +4573,7 @@ function redactNetworkHeaders(headers, includeSensitiveData = false, baseUrl = u
     if (/^data:/iu.test(text)) safeValue = redactNetworkUrl(text)
     else if (includeSensitiveData) safeValue = text.slice(0, 1_000)
     else if (normalizedName === ':path') safeValue = redactNetworkPath(value, baseUrl)
-    else if (/authorization|cookie|token|secret|password|credential|api[-_]?key|session|csrf|signature|proxy-auth/i.test(normalizedName)) {
+    else if (SENSITIVE_HEADER_PATTERN.test(normalizedName)) {
       safeValue = '[REDACTED]'
     } else safeValue = text.slice(0, 1_000)
     return [String(name).slice(0, 200), safeValue]
