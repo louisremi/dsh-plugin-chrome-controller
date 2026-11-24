@@ -32,8 +32,10 @@ describe('content detection', () => {
     assert.equal(detectKind(bytes('\r\n\r\n%PDF-1.7')), 'pdf')
   })
 
-  it('still detects a PDF behind 200 bytes of leading junk', () => {
-    assert.equal(detectKind(Buffer.concat([Buffer.alloc(200, 0x20), PDF])), 'pdf')
+  it('still detects a PDF behind 200 bytes of non-whitespace junk, not just spaces', () => {
+    const junk = bytes('junk '.repeat(40))
+    assert.equal(junk.length, 200)
+    assert.equal(detectKind(Buffer.concat([junk, PDF])), 'pdf')
   })
 
   it('recognises a stored ZIP whose first member is a PDF as a ZIP, not a PDF', () => {
