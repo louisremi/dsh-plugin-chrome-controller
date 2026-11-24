@@ -21,9 +21,25 @@ const DATA_URL_PATTERN = /data:[^\s"'<>`]+/giu
 const BASE64_RUN_PATTERN = new RegExp('[A-Za-z0-9+/=_-]{' + String(BASE64_RUN_MIN_CHARS) + ',}', 'gu')
 
 // Query parameters whose value is a credential or a short-lived signed value.
-const SENSITIVE_QUERY_KEY = 'token|key|secret|password|auth|session|signature|credential|expires'
+// Exported so snapshot and network redaction use this exact list instead of
+// restating (and drifting from) it.
+export const SENSITIVE_QUERY_KEY = 'token|key|secret|password|passwd|auth|session|cookie|csrf|signature|credential|expires|email'
 // Object fields that are always credentials, regardless of their shape.
 const SENSITIVE_OBJECT_KEY = /^(?:access_?token|refresh_?token|id_?token|bearer|authorization|api_?key|secret|password|passwd|session_?id)$/iu
+
+// The text patterns that mask a token shape: [source, flags] pairs whose two
+// capture groups are the prefix and the secret value. Exported as plain data so
+// the extension can pass them into injected page code, which cannot import this
+// module, and both places apply the same rules.
+export const TOKEN_MASK_RULES = Object.freeze([
+  ['([?&][^=&#\\s"\'`]*?(?:' + SENSITIVE_QUERY_KEY + ')[^=&#\\s"\'`]*=)([^&#\\s"\'`]*)', 'gi'],
+  ['(access_token(?:=|%3D))([^&"\'\\s]+)', 'gi'],
+  ['(["\']access_token["\']\\s*:\\s*["\'])([^"\']+)', 'gi'],
+  ['(authorization["\']?\\s*[:=]\\s*["\']?bearer\\s+)([^"\'\\s]+)', 'gi'],
+  ['(\\bbearer\\s+)([A-Za-z0-9._~+/=-]+)', 'gi'],
+])
+// Every rule keeps its prefix and replaces only the secret with this marker.
+export const TOKEN_MASK_REPLACEMENT = '$1' + REDACTED
 
 /**
  * Sanitize one evaluation value for the model.
@@ -98,24 +114,26 @@ function sanitizeString(text, counts) {
   return maskTokens(result, counts)
 }
 
-function elideDataUrl(dataUrl) {
-  const mime = /^data:([^;,]*)/iu.exec(dataUrl)?.[1]?.trim() || 'application/octet-stream'
-  const isBase64 = /^data:[^,]*;base64,/iu.test(dataUrl)
-  return 'data:' + mime + (isBase64 ? ';base64' : '') + ',…[' + String(dataUrl.length) + ' chars elided]'
+/**
+ * Compact placeholder for a data: URL: the MIME type and the length survive,
+ * the bytes never do. Shared by evaluation results and network capture.
+ */
+export function elideDataUrl(dataUrl) {
+  const text = String(dataUrl)
+  const metadata = /^data:([^,]*),/iu.exec(text)?.[1] ?? ''
+  const isBase64 = /(?:^|;)base64(?:;|$)/iu.test(metadata)
+  const mime = /^([^;]+)/u.exec(metadata)?.[1]?.trim()
+    || (isBase64 ? 'application/octet-stream' : 'data')
+  return 'data:' + mime + (isBase64 ? ';base64,' : ',') + '…[' + String(text.length) + ' chars elided]'
 }
 
 function maskTokens(text, counts) {
-  const mask = pattern => {
-    text = text.replace(pattern, (match, prefix, value) => {
+  for (const [source, flags] of TOKEN_MASK_RULES) {
+    text = text.replace(new RegExp(source, flags), (match, prefix, value) => {
       if (value === REDACTED) return match
       counts.redacted += 1
       return prefix + REDACTED
     })
   }
-  mask(new RegExp('([?&][^=&#\\s"\'`]*?(?:' + SENSITIVE_QUERY_KEY + ')[^=&#\\s"\'`]*=)([^&#\\s"\'`]*)', 'gi'))
-  mask(/(access_token(?:=|%3D))([^&"'\s]+)/gi)
-  mask(/(["']access_token["']\s*:\s*["'])([^"']+)/gi)
-  mask(/(authorization["']?\s*[:=]\s*["']?bearer\s+)([^"'\s]+)/gi)
-  mask(/(\bbearer\s+)([A-Za-z0-9._~+/=-]+)/gi)
   return text
 }

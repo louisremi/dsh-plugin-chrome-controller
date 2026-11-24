@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
-import { sanitizeEvaluationValue } from '../extension/evaluation-sanitize.js'
+import {
+  TOKEN_MASK_REPLACEMENT, TOKEN_MASK_RULES, elideDataUrl, sanitizeEvaluationValue,
+} from '../extension/evaluation-sanitize.js'
 
 const base64 = length => Buffer.from('invoice '.repeat(Math.ceil(length / 8))).toString('base64').slice(0, length)
 const elidedMarker = (n, mime = 'application/pdf') => 'data:' + mime + ';base64,…[' + String(n) + ' chars elided]'
@@ -109,5 +111,28 @@ describe('sanitizeEvaluationValue', () => {
     assert.match(JSON.stringify(result.value), /depth limit/u)
     assert.equal(result.elided, undefined)
     assert.equal(result.redacted, undefined)
+  })
+})
+
+describe('shared redaction rules', () => {
+  it('masks every shared sensitive query key', () => {
+    const url = 'https://api.test/x?passwd=1&cookie=2&csrf=3&email=me@test'
+    const result = sanitizeEvaluationValue({ url })
+    assert.equal(result.redacted, 4)
+    assert.equal(result.value.url, 'https://api.test/x?passwd=<redacted>&cookie=<redacted>&csrf=<redacted>&email=<redacted>')
+  })
+
+  it('exports serializable mask rules that reproduce the evaluation masking', () => {
+    const text = 'x?token=abc&lang=fr access_token=xyz Bearer top'
+    let masked = text
+    for (const [source, flags] of TOKEN_MASK_RULES) masked = masked.replace(new RegExp(source, flags), TOKEN_MASK_REPLACEMENT)
+    assert.equal(masked, 'x?token=<redacted>&lang=fr access_token=<redacted> Bearer <redacted>')
+  })
+
+  it('elides base64 and plain data URLs with one shared placeholder', () => {
+    const base64Url = 'data:application/pdf;base64,AAAA'
+    const plainUrl = 'data:text/plain,hello'
+    assert.equal(elideDataUrl(base64Url), 'data:application/pdf;base64,…[' + String(base64Url.length) + ' chars elided]')
+    assert.equal(elideDataUrl(plainUrl), 'data:text/plain,…[' + String(plainUrl.length) + ' chars elided]')
   })
 })
