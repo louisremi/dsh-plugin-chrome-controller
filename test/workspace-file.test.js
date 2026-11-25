@@ -4,7 +4,7 @@ import { mkdir, mkdtemp, readdir, readFile, realpath, rename, rm, symlink, write
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, it } from 'node:test'
-import { chooseFileName, fileNameFromDisposition, isSimpleFileName, requireBlobFileName, sanitizeFileName, saveWorkspaceFile } from '../lib/workspace-file.js'
+import { chooseFileName, fileNameFromDisposition, isSimpleFileName, MAX_FILE_NAME_CHARS, requireBlobFileName, sanitizeFileName, saveWorkspaceFile } from '../lib/workspace-file.js'
 
 describe('blob: file names', () => {
   const blobUrl = 'blob:https://e.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11'
@@ -29,6 +29,16 @@ describe('file name selection', () => {
     assert.equal(sanitizeFileName('a\u0000b:c.pdf'), 'a_b_c.pdf')
   })
 
+  it('keeps a truncated name safe and idempotent at the length limit', () => {
+    const truncated = sanitizeFileName('a'.repeat(199) + '. ')
+    assert.equal(truncated.length, 199)
+    assert.equal(isSimpleFileName(truncated), true)
+    assert.equal(sanitizeFileName(truncated), truncated)
+    const capped = sanitizeFileName('x'.repeat(250))
+    assert.equal(capped.length, MAX_FILE_NAME_CHARS)
+    assert.equal(sanitizeFileName(capped), capped)
+  })
+
   it('renames files DSH would read as agent instructions', () => {
     assert.equal(sanitizeFileName('AGENTS.md'), 'download-AGENTS.md')
     assert.equal(sanitizeFileName('claude.local.md'), 'download-claude.local.md')
@@ -51,6 +61,11 @@ describe('file name selection', () => {
     assert.equal(chooseFileName({ url: 'https://e.test/invoice' }), 'invoice')
     assert.equal(chooseFileName({ url: 'blob:https://e.test/3f1c2b7e-9a41-4c52-8d6a-0b7f6f6a1c11' }), 'download')
     assert.equal(chooseFileName({ requested: 'mine.pdf', url: 'blob:https://e.test/3f1c2b7e' }), 'mine.pdf')
+    // A Content-Disposition can carry an opaque, very long name; use the URL segment instead.
+    assert.equal(
+      chooseFileName({ contentDisposition: 'attachment; filename="' + 'a'.repeat(300) + '.pdf"', url: 'https://e.test/invoice' }),
+      'invoice',
+    )
   })
 })
 

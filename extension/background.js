@@ -1,3 +1,4 @@
+import { matchesAccept, selectDownloadCandidate } from './download-capture.js'
 import { MAX_TEXT_CHARS, MAX_XPATH_CHARS, normalizeText, selectElementTarget } from './element-target.js'
 import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
 import { SENSITIVE_QUERY_KEY, elideDataUrl, sanitizeEvaluationValue } from './evaluation-sanitize.js'
@@ -123,6 +124,18 @@ const MAX_NETWORK_COOKIES = 500
 const MAX_CONSOLE_ENTRIES = 200
 const MAX_EXTRACT_ITEMS = 100
 const MAX_EXTRACT_CHARS = 50_000
+// Capturing a download: the click opens four possible sources for timeoutMs,
+// and each source can report at most a few files to keep the result small.
+const DEFAULT_CAPTURE_DOWNLOAD_TIMEOUT_MS = 10_000
+const MAX_CAPTURE_DOWNLOAD_TIMEOUT_MS = 30_000
+const CAPTURE_DOWNLOAD_POLL_MS = 100
+const CAPTURE_DOWNLOAD_SPY_READ_MS = 200
+const MAX_CAPTURE_DOWNLOAD_ACCEPT_ENTRIES = 10
+const MAX_CAPTURE_DOWNLOAD_ACCEPT_CHARS = 100
+const MAX_CAPTURE_DOWNLOAD_CANDIDATES = 50
+const MAX_CAPTURE_DOWNLOAD_RESPONSE_BODIES = 10
+const MAX_CAPTURE_DOWNLOAD_NETWORK_BYTES = 20 * 1024 * 1024
+const MAX_CAPTURE_DOWNLOAD_ALSO = 10
 // Base64 inflates by 4/3, so 10 MB stays below the DSH bridge's 20 MB body limit.
 const MAX_FETCH_FILE_BYTES = 10 * 1024 * 1024
 // A credentialed service-worker retry must be approved by the user in DSH
@@ -635,6 +648,105 @@ async function resolveElementTargetFor(tabId, declaration, debuggee) {
   }
 }
 
+/**
+ * Validate a click declaration and return its mode: "selector", "xpath",
+ * "text", or undefined for viewport coordinates. Shared by dsh_browser_click
+ * and dsh_browser_capture_download, which click their target the same way.
+ */
+function requireClickTarget(params) {
+  const mode = requireTargetDeclaration(params)
+  const hasElement = mode !== undefined
+  const hasCoordinates = Number.isFinite(params.x) && Number.isFinite(params.y)
+  if (mode === 'selector') requireCssSelector(params.selector)
+  if (hasElement && (params.x !== undefined || params.y !== undefined)) {
+    throw new Error('Provide a selector, xpath, or text, or x and y click coordinates, not both')
+  }
+  if (!hasElement && !hasCoordinates) throw new Error('Provide a CSS selector or x and y click coordinates')
+  if (hasCoordinates && (params.x < 0 || params.y < 0 || params.x > 10000 || params.y > 10000)) {
+    throw new Error('Click coordinates must be between 0 and 10000')
+  }
+  return mode
+}
+
+/**
+ * Resolve the viewport point a real pointer click would hit, after scrolling an
+ * element target into view and validating that it is visible, enabled, in the
+ * viewport, and not covered. Coordinates are checked against the current
+ * viewport. Needs an already attached debuggee target.
+ */
+async function resolveClickPoint(tabId, params, mode, target) {
+  let x = params.x
+  let y = params.y
+  let elementResult = {}
+  if (mode === 'xpath' || mode === 'text') {
+    const resolved = await resolveElementTarget(tabId, params, target)
+    if (resolved.visible !== true) {
+      throw new Error('The selected element could not be brought into the viewport')
+    }
+    if (resolved.disabled === true) throw new Error('The selected element is disabled')
+    if (resolved.pointerEvents === 'none') throw new Error('The selected element does not receive pointer events')
+    if (resolved.x < 0 || resolved.y < 0
+      || resolved.x >= resolved.viewportWidth || resolved.y >= resolved.viewportHeight) {
+      throw new Error('The selected element is outside the viewport after scrolling')
+    }
+    if (resolved.hit !== true) throw new Error('The selected element is covered at its click point')
+    x = resolved.x
+    y = resolved.y
+    elementResult = {
+      xpath: resolved.xpath,
+      ...(mode === 'text' ? { text: resolved.text } : {}),
+      index: resolved.index,
+    }
+  } else if (mode === 'selector') {
+    const nodeId = await querySelectorNode(target, params.selector)
+    const scrollInfo = await callNodeFunction(target, nodeId, SCROLL_TO_VIEW_FUNCTION)
+    if (!isRecord(scrollInfo) || scrollInfo.visible !== true) {
+      throw new Error('The selected element could not be brought into the viewport')
+    }
+    const info = await callNodeFunction(target, nodeId, CLICK_INFO_FUNCTION)
+    if (!isRecord(info)) throw new Error('The selected element could not be inspected')
+    if (info.disabled === true) throw new Error('The selected element is disabled')
+    if (info.pointerEvents === 'none') throw new Error('The selected element does not receive pointer events')
+    const box = await debuggerCommand(target, 'DOM.getBoxModel', { nodeId })
+    const quad = box?.model?.content ?? box?.model?.border
+    if (!Array.isArray(quad) || quad.length !== 8 || !quad.every(Number.isFinite)) {
+      throw new Error('The selected element has no clickable area')
+    }
+    x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
+    y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
+    const viewportWidth = Number.isFinite(info.viewportWidth) ? info.viewportWidth : scrollInfo.width
+    const viewportHeight = Number.isFinite(info.viewportHeight) ? info.viewportHeight : scrollInfo.height
+    if (x < 0 || y < 0 || x >= viewportWidth || y >= viewportHeight) {
+      throw new Error('The selected element is outside the viewport after scrolling')
+    }
+    const hitTarget = await callNodeFunction(target, nodeId, CLICK_HIT_TEST_FUNCTION, [x, y])
+    if (hitTarget !== true) throw new Error('The selected element is covered at its click point')
+    debuggerTargetsNeedingFreshCoordinates.delete(target)
+  } else {
+    if (debuggerTargetsNeedingFreshCoordinates.has(target)) {
+      throw new Error('Chrome changed the page viewport when browser control connected. Take a fresh screenshot or use a CSS selector, then retry.')
+    }
+    const viewport = await viewportSize(target)
+    if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
+      throw new Error('Click coordinates are outside the viewport. Scroll the target into view and use current viewport coordinates.')
+    }
+  }
+  return { x, y, elementResult }
+}
+
+/** Dispatch a real left click at a viewport point through the attached debuggee. */
+async function dispatchClick(target, x, y) {
+  await debuggerCommand(target, 'Input.dispatchMouseEvent', {
+    type: 'mouseMoved', x, y, button: 'none', buttons: 0, modifiers: 0,
+  })
+  await debuggerCommand(target, 'Input.dispatchMouseEvent', {
+    type: 'mousePressed', x, y, button: 'left', clickCount: 1,
+  })
+  await debuggerCommand(target, 'Input.dispatchMouseEvent', {
+    type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
+  })
+}
+
 /** Resolve a CSS selector against the main document and require exactly one match. */
 async function querySelectorNode(target, selector) {
   const document = await debuggerCommand(target, 'DOM.getDocument', { depth: 1, pierce: true })
@@ -932,12 +1044,14 @@ function delay(ms, signal) {
 }
 
 /**
- * Response upload timeout. Only page.fetchFile and page.fetchFileRetry results carry file bytes large
- * enough to need more: 10 s plus 10 s per MB of base64. Every other operation
- * keeps the default 10 s.
+ * Response upload timeout. Only operations whose results carry file bytes large enough to need more
+ * get it: 10 s plus 10 s per MB of base64. Every other operation keeps the
+ * default 10 s.
  */
 function responseTimeoutMs(method, result) {
-  if ((method !== 'page.fetchFile' && method !== 'page.fetchFileRetry') || typeof result?.base64 !== 'string') return 10_000
+  const carriesFileBytes = method === 'page.fetchFile' || method === 'page.fetchFileRetry'
+    || method === 'page.captureDownload'
+  if (!carriesFileBytes || typeof result?.base64 !== 'string') return 10_000
   return 10_000 + Math.ceil(result.base64.length / (1024 * 1024)) * 10_000
 }
 
@@ -1561,6 +1675,8 @@ async function executeBrowserOperationNow(method, params, signal) {
     }
     case 'page.networkCapture':
       return captureNetwork(params, signal)
+    case 'page.captureDownload':
+      return captureDownload(params, signal)
     case 'page.consoleCapture':
       return captureConsole(params, signal)
     case 'page.extract':
@@ -2209,89 +2325,15 @@ async function executeBrowserOperationNow(method, params, signal) {
     }
     case 'page.click': {
       const tabId = requireTabId(params.tabId)
-      const mode = requireTargetDeclaration(params)
-      const hasSelector = mode === 'selector'
-      const hasElement = mode !== undefined
-      const hasCoords = Number.isFinite(params.x) && Number.isFinite(params.y)
-      const animate = true
-      if (hasSelector) requireCssSelector(params.selector)
-      if (hasElement && (params.x !== undefined || params.y !== undefined)) {
-        throw new Error('Provide a selector, xpath, or text, or x and y click coordinates, not both')
-      }
-      if (!hasElement && !hasCoords) throw new Error('Provide a CSS selector or x and y click coordinates')
-      if (hasCoords && (params.x < 0 || params.y < 0 || params.x > 10000 || params.y > 10000)) {
-        throw new Error('Click coordinates must be between 0 and 10000')
-      }
+      const mode = requireClickTarget(params)
       return withDebugger(tabId, async target => {
-        let x = params.x
-        let y = params.y
-        let elementResult = {}
-        if (mode === 'xpath' || mode === 'text') {
-          const resolved = await resolveElementTarget(tabId, params, target)
-          if (resolved.visible !== true) {
-            throw new Error('The selected element could not be brought into the viewport')
-          }
-          if (resolved.disabled === true) throw new Error('The selected element is disabled')
-          if (resolved.pointerEvents === 'none') throw new Error('The selected element does not receive pointer events')
-          if (resolved.x < 0 || resolved.y < 0
-            || resolved.x >= resolved.viewportWidth || resolved.y >= resolved.viewportHeight) {
-            throw new Error('The selected element is outside the viewport after scrolling')
-          }
-          if (resolved.hit !== true) throw new Error('The selected element is covered at its click point')
-          x = resolved.x
-          y = resolved.y
-          elementResult = {
-            xpath: resolved.xpath,
-            ...(mode === 'text' ? { text: resolved.text } : {}),
-            index: resolved.index,
-          }
-        } else if (hasSelector) {
-          const nodeId = await querySelectorNode(target, params.selector)
-          const scrollInfo = await callNodeFunction(target, nodeId, SCROLL_TO_VIEW_FUNCTION)
-          if (!isRecord(scrollInfo) || scrollInfo.visible !== true) {
-            throw new Error('The selected element could not be brought into the viewport')
-          }
-          const info = await callNodeFunction(target, nodeId, CLICK_INFO_FUNCTION)
-          if (!isRecord(info)) throw new Error('The selected element could not be inspected')
-          if (info.disabled === true) throw new Error('The selected element is disabled')
-          if (info.pointerEvents === 'none') throw new Error('The selected element does not receive pointer events')
-          const box = await debuggerCommand(target, 'DOM.getBoxModel', { nodeId })
-          const quad = box?.model?.content ?? box?.model?.border
-          if (!Array.isArray(quad) || quad.length !== 8 || !quad.every(Number.isFinite)) {
-            throw new Error('The selected element has no clickable area')
-          }
-          x = (quad[0] + quad[2] + quad[4] + quad[6]) / 4
-          y = (quad[1] + quad[3] + quad[5] + quad[7]) / 4
-          const viewportWidth = Number.isFinite(info.viewportWidth) ? info.viewportWidth : scrollInfo.width
-          const viewportHeight = Number.isFinite(info.viewportHeight) ? info.viewportHeight : scrollInfo.height
-          if (x < 0 || y < 0 || x >= viewportWidth || y >= viewportHeight) {
-            throw new Error('The selected element is outside the viewport after scrolling')
-          }
-          const hitTarget = await callNodeFunction(target, nodeId, CLICK_HIT_TEST_FUNCTION, [x, y])
-          if (hitTarget !== true) throw new Error('The selected element is covered at its click point')
-          debuggerTargetsNeedingFreshCoordinates.delete(target)
-        } else {
-          if (debuggerTargetsNeedingFreshCoordinates.has(target)) {
-            throw new Error('Chrome changed the page viewport when browser control connected. Take a fresh screenshot or use a CSS selector, then retry.')
-          }
-          const viewport = await viewportSize(target)
-          if (x < 0 || y < 0 || x >= viewport.width || y >= viewport.height) {
-            throw new Error('Click coordinates are outside the viewport. Scroll the target into view and use current viewport coordinates.')
-          }
-        }
-        if (animate) await visualCursorMove(tabId, x, y, true)
-        await debuggerCommand(target, 'Input.dispatchMouseEvent', {
-          type: 'mouseMoved', x, y, button: 'none', buttons: 0, modifiers: 0,
-        })
-        await debuggerCommand(target, 'Input.dispatchMouseEvent', {
-          type: 'mousePressed', x, y, button: 'left', clickCount: 1,
-        })
-        await debuggerCommand(target, 'Input.dispatchMouseEvent', {
-          type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
-        })
+        const clickPoint = await resolveClickPoint(tabId, params, mode, target)
+        await visualCursorMove(tabId, clickPoint.x, clickPoint.y, true)
+        await dispatchClick(target, clickPoint.x, clickPoint.y)
         return {
-          tabId, clicked: true, ...elementResult,
-          ...(hasSelector ? { selector: params.selector } : {}), x, y,
+          tabId, clicked: true, ...clickPoint.elementResult,
+          ...(mode === 'selector' ? { selector: params.selector } : {}),
+          x: clickPoint.x, y: clickPoint.y,
         }
       })
     }
@@ -4839,6 +4881,758 @@ async function captureNetwork(params, signal) {
     } finally {
       chrome.debugger.onEvent.removeListener(onEvent)
       await debuggerCommand(target, 'Network.disable').catch(() => {})
+    }
+  })
+}
+
+/**
+ * Injected into the clicked tab's main world before the click: record the blob
+ * URLs the page creates, the download links its own scripts click, and the
+ * bodies of the files it fetches with fetch/XHR. State lives on a window global
+ * so a later isolated-world call can read it; the originals are kept so the
+ * finally can restore every wrapper. A page navigation discards the state and
+ * the wrappers with the old document, which is why the tool reports
+ * navigated: true and a second call is the retry.
+ */
+function installCaptureDownloadSpy() {
+  const KEY = '__dshCaptureDownloadSpy'
+  const MAX_RECORDS = 20
+  const MAX_RESPONSES = 8
+  const MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+  // The debugger source budgets 20 MB for response bodies; keep the page copy
+  // under the same budget so one click cannot pin 8 x 10 MB in the tab.
+  const MAX_RECORDED_RESPONSE_BYTES = 20 * 1024 * 1024
+  const previous = globalThis[KEY]
+  if (previous !== undefined && previous.active === true) {
+    try { URL.createObjectURL = previous.originalCreateObjectURL } catch {}
+    try { HTMLAnchorElement.prototype.click = previous.originalAnchorClick } catch {}
+    try { globalThis.fetch = previous.originalFetch } catch {}
+    try {
+      if (globalThis.XMLHttpRequest !== undefined) globalThis.XMLHttpRequest.prototype.send = previous.originalXhrSend
+    } catch {}
+  }
+  const state = {
+    active: true,
+    blobs: [],
+    anchors: [],
+    responses: [],
+    recordedResponseBytes: 0,
+    installedAt: Date.now(),
+    originalCreateObjectURL: URL.createObjectURL,
+    originalAnchorClick: HTMLAnchorElement.prototype.click,
+    originalFetch: globalThis.fetch,
+    originalXhrSend: globalThis.XMLHttpRequest?.prototype?.send,
+  }
+  // A response body the page fetched itself. The bytes stay in the page until
+  // the extension asks for the one file it selected; only file-like types are
+  // kept, so a page's JSON/XHR chatter never costs memory. The debugger's
+  // Network source misses document-fetch responses in practice, so this page
+  // path is what captures an invoice the page fetched with fetch/XHR.
+  const recordResponse = (url, type, buffer) => {
+    try {
+      if (state.responses.length >= MAX_RESPONSES) return
+      if (!(buffer instanceof ArrayBuffer)) return
+      const size = buffer.byteLength
+      if (size === 0 || size > MAX_RESPONSE_BYTES) return
+      if (state.recordedResponseBytes + size > MAX_RECORDED_RESPONSE_BYTES) return
+      const mime = String(type ?? '').split(';')[0].trim().toLowerCase()
+      if (mime === 'text/html' || mime === 'application/xhtml+xml' || mime === 'text/css'
+        || mime === 'application/json' || mime.endsWith('+json')
+        || mime.includes('javascript') || mime.includes('ecmascript')) return
+      const text = String(url ?? '')
+      if (text === '' || text.startsWith('blob:')) return
+      state.responses.push({ url: text, type: String(type ?? ''), size, buffer, at: Date.now() })
+      state.recordedResponseBytes += size
+    } catch {
+      // Recording is best-effort; the page's request still runs.
+    }
+  }
+  URL.createObjectURL = function createObjectURL(object) {
+    const url = state.originalCreateObjectURL.call(URL, object)
+    try {
+      if (object instanceof Blob && state.blobs.length < MAX_RECORDS) {
+        state.blobs.push({
+          url: String(url),
+          type: String(object.type ?? ''),
+          size: Number(object.size) || 0,
+          at: Date.now(),
+        })
+      }
+    } catch {
+      // Recording is best-effort; the blob URL itself is still returned.
+    }
+    return url
+  }
+  HTMLAnchorElement.prototype.click = function click() {
+    try {
+      if (state.anchors.length < MAX_RECORDS && this.hasAttribute('download')) {
+        state.anchors.push({
+          href: String(this.href ?? ''),
+          download: String(this.getAttribute('download') ?? ''),
+          at: Date.now(),
+        })
+      }
+    } catch {
+      // Recording is best-effort; the page's click still runs.
+    }
+    return state.originalAnchorClick.call(this)
+  }
+  if (typeof state.originalFetch === 'function') {
+    globalThis.fetch = function captureDownloadFetch(...args) {
+      const result = state.originalFetch.apply(this, args)
+      try {
+        result.then(response => {
+          try {
+            if (!response || response.ok === false || response.type === 'opaque' || response.type === 'opaqueredirect') return
+            const headers = response.headers
+            const type = typeof headers?.get === 'function' ? headers.get('content-type') : ''
+            response.clone().arrayBuffer()
+              .then(buffer => recordResponse(response.url, type, buffer))
+              .catch(() => {})
+          } catch {
+            // A streamed or opaque response cannot be cloned; the page still gets it.
+          }
+        }).catch(() => {})
+      } catch {
+        // The request still runs; only the recording is skipped.
+      }
+      return result
+    }
+  }
+  if (typeof state.originalXhrSend === 'function') {
+    globalThis.XMLHttpRequest.prototype.send = function captureDownloadXhrSend(...args) {
+      try {
+        this.addEventListener('load', () => {
+          try {
+            const url = this.responseURL
+            const type = this.getResponseHeader('content-type') ?? ''
+            const response = this.response
+            if (response instanceof Blob) {
+              response.arrayBuffer()
+                .then(buffer => recordResponse(url, type || response.type, buffer))
+                .catch(() => {})
+            } else if (response instanceof ArrayBuffer) {
+              recordResponse(url, type, response.slice(0))
+            } else if (typeof response === 'string') {
+              recordResponse(url, type, new TextEncoder().encode(response).buffer)
+            }
+          } catch {
+            // A response type we cannot read is skipped; the page still gets it.
+          }
+        }, { once: true })
+      } catch {
+        // The request still runs; only the recording is skipped.
+      }
+      return state.originalXhrSend.apply(this, args)
+    }
+  }
+  globalThis[KEY] = state
+  return { installed: true }
+}
+
+/** Injected into the clicked tab: read the capture spy's recorded blobs, anchors, and fetches. */
+function readCaptureDownloadSpy() {
+  const state = globalThis.__dshCaptureDownloadSpy
+  if (state === undefined || state.active !== true) return { active: false, blobs: [], anchors: [], responses: [] }
+  return {
+    active: true,
+    blobs: state.blobs.map(record => ({ url: record.url, type: record.type, size: record.size, at: record.at })),
+    anchors: state.anchors.map(record => ({ href: record.href, download: record.download, at: record.at })),
+    responses: state.responses.map(record => ({ url: record.url, type: record.type, size: record.size, at: record.at })),
+  }
+}
+
+/** Injected into the clicked tab: the bytes of one page-fetched response the capture accepted. */
+function readCaptureDownloadResponseBytes(url) {
+  const state = globalThis.__dshCaptureDownloadSpy
+  if (state === undefined || state.active !== true || typeof url !== 'string') return { error: 'unavailable' }
+  const record = Array.isArray(state.responses) ? state.responses.find(item => item.url === url) : undefined
+  if (record === undefined || !(record.buffer instanceof ArrayBuffer)) return { error: 'unavailable' }
+  const bytes = new Uint8Array(record.buffer)
+  // Injected page functions cannot call the service worker's encodeBase64Bytes,
+  // so this encodes in place; keep the two loops in sync.
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000))
+  }
+  return { base64: btoa(binary), bytes: bytes.length, contentType: typeof record.type === 'string' ? record.type : '' }
+}
+
+/** Injected into the clicked tab: restore every wrapper the spy replaced. */
+function uninstallCaptureDownloadSpy() {
+  const state = globalThis.__dshCaptureDownloadSpy
+  if (state === undefined) return { removed: false }
+  try { URL.createObjectURL = state.originalCreateObjectURL } catch {}
+  try { HTMLAnchorElement.prototype.click = state.originalAnchorClick } catch {}
+  try { if (typeof state.originalFetch === 'function') globalThis.fetch = state.originalFetch } catch {}
+  try {
+    if (typeof state.originalXhrSend === 'function') globalThis.XMLHttpRequest.prototype.send = state.originalXhrSend
+  } catch {}
+  state.active = false
+  delete globalThis.__dshCaptureDownloadSpy
+  return { removed: true }
+}
+
+/** Base64-encode bytes without spreading a large array into String.fromCharCode. */
+function encodeBase64Bytes(bytes) {
+  let binary = ''
+  for (let index = 0; index < bytes.length; index += 0x8000) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(index, index + 0x8000))
+  }
+  return btoa(binary)
+}
+
+/** Number of bytes a base64 string decodes to, without decoding it. */
+function base64ByteLength(value) {
+  const text = String(value ?? '').replace(/=+$/u, '')
+  if (text === '') return 0
+  return Math.floor(text.length * 3 / 4)
+}
+
+/** Validate an accept list sent by the plugin, defensively. */
+function requireCaptureAccept(value) {
+  if (value === undefined) return undefined
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_CAPTURE_DOWNLOAD_ACCEPT_ENTRIES) {
+    throw new Error('accept must contain 1 to ' + String(MAX_CAPTURE_DOWNLOAD_ACCEPT_ENTRIES) + ' MIME types or extensions')
+  }
+  return value.map(entry => {
+    if (typeof entry !== 'string') throw new Error('accept entries must be MIME types or extensions')
+    const trimmed = entry.trim()
+    if (trimmed === '' || trimmed.length > MAX_CAPTURE_DOWNLOAD_ACCEPT_CHARS || /\s/u.test(trimmed)) {
+      throw new Error('accept entries must be MIME types or extensions')
+    }
+    return trimmed
+  })
+}
+
+/** A URL a capture may hand back: http(s), or a blob: URL minted by an http(s) page. */
+function captureCandidateUrl(value) {
+  if (typeof value !== 'string' || value === '') return undefined
+  let url
+  try { url = new URL(value) } catch { return undefined }
+  if (url.protocol === 'http:' || url.protocol === 'https:') {
+    if (url.username !== '' || url.password !== '') return undefined
+    return url.href
+  }
+  if (url.protocol !== 'blob:') return undefined
+  let inner
+  try { inner = new URL(url.pathname) } catch { return undefined }
+  if (inner.protocol !== 'http:' && inner.protocol !== 'https:') return undefined
+  if (inner.username !== '' || inner.password !== '') return undefined
+  return url.href
+}
+
+/** Origin of an http(s) or blob: URL, for the model; never the URL itself. */
+function captureSourceOrigin(value) {
+  if (typeof value !== 'string' || value === '') return ''
+  try {
+    const url = new URL(value)
+    if (url.protocol === 'blob:') {
+      try { return new URL(url.pathname).origin } catch { return '' }
+    }
+    return url.origin
+  } catch {
+    return ''
+  }
+}
+
+/** The Content-Type a network response declared, from its headers or CDP's sniffed mimeType. */
+function networkResponseContentType(response) {
+  const headers = isRecord(response?.headers) ? response.headers : {}
+  const header = headers['content-type'] ?? headers['Content-Type']
+  if (typeof header === 'string' && header !== '') return header
+  return String(response?.mimeType ?? '')
+}
+
+/** The Content-Disposition a network response declared, for the file name. */
+function networkResponseDisposition(response) {
+  const headers = isRecord(response?.headers) ? response.headers : {}
+  const header = headers['content-disposition'] ?? headers['Content-Disposition']
+  return typeof header === 'string' ? header : ''
+}
+
+/** Whether a Chrome download belongs to the clicked tab. Chrome reports -1 for a download it cannot attribute. */
+function downloadBelongsToTab(item, state) {
+  if (Number.isInteger(item?.tabId) && item.tabId >= 0) {
+    if (item.tabId === state.tabId) return true
+    // A document the click opened in a new tab can start the download itself
+    // (a window.open popup does), so its tab is ours too.
+    return state.openedTabs.has(item.tabId) || state.unattributedTabs.has(item.tabId)
+  }
+  const referrer = typeof item?.referrer === 'string' ? item.referrer : ''
+  if (referrer !== '') {
+    if (state.tabUrl !== '' && referrer === state.tabUrl) return true
+    if (state.tabOrigin !== '' && captureSourceOrigin(referrer) === state.tabOrigin) return true
+  }
+  // Chrome reports some popup downloads as unowned (no tabId, no referrer).
+  // Those cannot be told apart from a download the user started, and erasing
+  // one would destroy a file the capture never saves, so ignore them.
+  return false
+}
+
+/** A file name Chrome proposed for a download, stripped to its last segment. */
+function captureSuggestedFileName(value) {
+  if (typeof value !== 'string' || value === '') return undefined
+  const base = value.split(/[\\/]/u).pop() ?? ''
+  const name = base.trim().slice(0, 200).trim()
+  return name === '' ? undefined : name
+}
+
+/** Cancel and erase one Chrome download the capture intercepted. */
+async function discardChromeDownload(id) {
+  try { await chrome.downloads.cancel(id) } catch {}
+  try { await chrome.downloads.erase({ id }) } catch {}
+}
+
+/** Close one tab the captured click opened. */
+async function closeCaptureDownloadTab(tabId) {
+  try { await chrome.tabs.remove(tabId) } catch {}
+}
+
+/** Record one capture candidate, keeping the bounded list. */
+function recordCaptureDownloadCandidate(state, candidate) {
+  if (state.candidates.length < MAX_CAPTURE_DOWNLOAD_CANDIDATES) state.candidates.push(candidate)
+}
+
+/**
+ * Build the capture state and its three Chrome event listeners. Sources are
+ * armed before the click: downloads are intercepted and cancelled on creation,
+ * tabs opened by the click are remembered so their URL can be read, and
+ * network responses with a file type are kept for a body read when they finish.
+ */
+function createCaptureDownloadState({ tabId, tabUrl, tabOrigin, accept }) {
+  const state = {
+    tabId,
+    tabUrl,
+    tabOrigin,
+    accept,
+    candidates: [],
+    navigated: false,
+    spyInstalled: false,
+    lastSpyReadAt: 0,
+    seenUrls: new Set(),
+    openedTabs: new Map(),
+    // Tabs that appeared without an opener and without a URL while the capture
+    // was armed. A download started from one of them is this click's document
+    // (Microsoft's window.open popup does this), but the tab is not closed.
+    unattributedTabs: new Set(),
+    pendingDiscards: new Set(),
+    responseRequests: new Map(),
+    responseBodies: 0,
+    networkBytes: 0,
+    pendingBodies: new Set(),
+    target: undefined,
+  }
+  state.onDownloadCreated = item => {
+    try {
+      if (!isRecord(item) || !downloadBelongsToTab(item, state)) return
+      const url = captureCandidateUrl(item.finalUrl || item.url)
+      const contentType = typeof item.mime === 'string' ? item.mime : ''
+      // A download the capture cannot fetch (data:, file:) or has not accepted
+      // is left to Chrome: cancelling it would erase the user's file while
+      // nothing is saved in its place.
+      if (url === undefined || !matchesAccept({ url, contentType }, state.accept)) return
+      if (Number.isSafeInteger(item.id)) state.pendingDiscards.add(discardChromeDownload(item.id))
+      // A download started in a tab the click opened is a window-open capture;
+      // one started in the clicked tab (or by its referrer) is a plain download.
+      const downloadTabId = Number.isSafeInteger(item.tabId) && item.tabId >= 0 ? item.tabId : undefined
+      const openedTab = downloadTabId !== undefined && downloadTabId !== state.tabId
+      const suggestedFileName = captureSuggestedFileName(item.filename)
+      recordCaptureDownloadCandidate(state, {
+        source: 'url',
+        via: openedTab ? 'window-open' : 'download',
+        url,
+        contentType: typeof item.mime === 'string' ? item.mime : '',
+        ...(suggestedFileName === undefined ? {} : { suggestedFileName }),
+        ...(Number.isSafeInteger(item.fileSize) && item.fileSize > 0 ? { bytes: item.fileSize } : {}),
+        observedAt: Date.now(),
+      })
+    } catch {
+      // A malformed download item must not break the capture window.
+    }
+  }
+  state.onTabCreated = tab => {
+    try {
+      if (!isRecord(tab) || !Number.isSafeInteger(tab.id)) return
+      if (tab.openerTabId !== undefined && tab.openerTabId !== state.tabId) return
+      const known = captureCandidateUrl(tab.pendingUrl) ?? captureCandidateUrl(tab.url)
+      if (tab.openerTabId !== state.tabId && known === undefined) {
+        // No opener and no URL: a popup the click opened with noopener. It can
+        // still start the document download itself, so remember it for
+        // download attribution without closing an operator's own new tab.
+        state.unattributedTabs.add(tab.id)
+        return
+      }
+      if (!state.openedTabs.has(tab.id)) state.openedTabs.set(tab.id, undefined)
+    } catch {
+      // Ignore a tab event that cannot be read.
+    }
+  }
+  // A popup can navigate and close faster than the poll loop; record its URL
+  // from the tab update while the tab is still there.
+  state.onTabUpdated = (updatedTabId, changeInfo, tab) => {
+    try {
+      if (!Number.isSafeInteger(updatedTabId) || updatedTabId === state.tabId) return
+      if (!state.openedTabs.has(updatedTabId) && !state.unattributedTabs.has(updatedTabId)) return
+      if (state.openedTabs.get(updatedTabId) !== undefined) return
+      const url = captureCandidateUrl(changeInfo?.url)
+        ?? captureCandidateUrl(tab?.url)
+        ?? captureCandidateUrl(tab?.pendingUrl)
+      if (url === undefined) return
+      if (state.openedTabs.has(updatedTabId)) state.openedTabs.set(updatedTabId, { url })
+      recordCaptureDownloadCandidate(state, {
+        source: 'url',
+        via: 'window-open',
+        url,
+        contentType: '',
+        observedAt: Date.now(),
+      })
+    } catch {
+      // Ignore a tab update that cannot be read.
+    }
+  }
+  state.onDebuggerEvent = (source, method, eventParams = {}) => {
+    try {
+      if (source?.tabId !== state.tabId) return
+      if (method === 'Page.frameNavigated') {
+        if (eventParams.frame?.parentId === undefined) state.navigated = true
+        return
+      }
+      if (method === 'Page.loadEventFired') {
+        state.navigated = true
+        return
+      }
+      if (method === 'Network.responseReceived') {
+        const requestId = eventParams.requestId
+        if (typeof requestId !== 'string' || state.responseRequests.has(requestId)) return
+        if (state.responseRequests.size >= MAX_CAPTURE_DOWNLOAD_CANDIDATES) return
+        const response = isRecord(eventParams.response) ? eventParams.response : {}
+        const url = captureCandidateUrl(response.url)
+        if (url === undefined) return
+        const contentType = networkResponseContentType(response)
+        // Bodies are only fetched for files the capture could save, so a click's
+        // page loads and analytics responses never cost memory.
+        if (!matchesAccept({ contentType, url }, state.accept)) return
+        state.responseRequests.set(requestId, {
+          requestId,
+          url,
+          status: Number(response.status) || 0,
+          resourceType: String(eventParams.type ?? ''),
+          contentType,
+          contentDisposition: networkResponseDisposition(response),
+          encodedDataLength: 0,
+          observedAt: Date.now(),
+        })
+        return
+      }
+      if (method === 'Network.loadingFinished') {
+        const record = state.responseRequests.get(eventParams.requestId)
+        if (record === undefined) return
+        record.encodedDataLength = Number(eventParams.encodedDataLength) || 0
+        state.responseRequests.delete(record.requestId)
+        const promise = loadCaptureDownloadResponseBody(state, record)
+        state.pendingBodies.add(promise)
+        void promise.finally(() => state.pendingBodies.delete(promise))
+      }
+    } catch {
+      // Debugger events are best-effort; one malformed event must not break the capture.
+    }
+  }
+  return state
+}
+
+/**
+ * Fetch one matching network response's body while the debugger still owns the
+ * request, and record its bytes as a candidate. The body is decoded in the
+ * extension only; the plugin receives base64, never a response URL with a token.
+ */
+async function loadCaptureDownloadResponseBody(state, record) {
+  if (state.responseBodies >= MAX_CAPTURE_DOWNLOAD_RESPONSE_BODIES) return
+  if (state.networkBytes >= MAX_CAPTURE_DOWNLOAD_NETWORK_BYTES) return
+  if (record.encodedDataLength > MAX_FETCH_FILE_BYTES) return
+  state.responseBodies++
+  try {
+    const body = await debuggerCommand(state.target, 'Network.getResponseBody', { requestId: record.requestId })
+    const encoded = typeof body?.body === 'string' ? body.body : ''
+    const base64 = body?.base64Encoded === true ? encoded : encodeBase64Bytes(new TextEncoder().encode(encoded))
+    const bytes = base64ByteLength(base64)
+    if (bytes === 0 || bytes > MAX_FETCH_FILE_BYTES) return
+    state.networkBytes += bytes
+    recordCaptureDownloadCandidate(state, {
+      source: 'bytes',
+      via: 'response',
+      url: record.url,
+      contentType: record.contentType,
+      contentDisposition: record.contentDisposition,
+      base64,
+      bytes,
+      observedAt: record.observedAt,
+    })
+  } catch {
+    // Chrome evicted the body, or the page navigated away: another source may
+    // still capture the file.
+  }
+}
+
+/** Arm every capture source before the click, so nothing it starts is missed. */
+async function armCaptureDownloadSources(state, target) {
+  state.target = target
+  chrome.downloads.onCreated.addListener(state.onDownloadCreated)
+  chrome.tabs.onCreated?.addListener(state.onTabCreated)
+  chrome.tabs.onUpdated?.addListener(state.onTabUpdated)
+  chrome.debugger.onEvent.addListener(state.onDebuggerEvent)
+  try {
+    await runInFrame(state.tabId, 0, installCaptureDownloadSpy, [], 'MAIN')
+    state.spyInstalled = true
+  } catch {
+    // A page that cannot run injected scripts still has the download, tab, and
+    // network sources.
+  }
+  await debuggerCommand(target, 'Network.enable', {
+    maxTotalBufferSize: MAX_CAPTURE_DOWNLOAD_NETWORK_BYTES,
+    maxResourceBufferSize: MAX_FETCH_FILE_BYTES,
+  })
+  await debuggerCommand(target, 'Page.enable')
+}
+
+/** Disarm every capture source and clean up whatever the click produced. */
+async function disarmCaptureDownloadSources(state) {
+  chrome.downloads.onCreated.removeListener(state.onDownloadCreated)
+  chrome.tabs.onCreated?.removeListener(state.onTabCreated)
+  chrome.tabs.onUpdated?.removeListener(state.onTabUpdated)
+  chrome.debugger.onEvent.removeListener(state.onDebuggerEvent)
+  for (const openedTabId of [...state.openedTabs.keys()]) await closeCaptureDownloadTab(openedTabId)
+  if (state.spyInstalled) {
+    // Only the main world can restore the page's URL.createObjectURL and
+    // anchor click wrappers; an isolated-world assignment would leave them in place.
+    try { await runInFrame(state.tabId, 0, uninstallCaptureDownloadSpy, [], 'MAIN') } catch {}
+  }
+  if (state.pendingDiscards.size > 0) await Promise.allSettled([...state.pendingDiscards])
+  try { await debuggerCommand(state.target, 'Page.disable') } catch {}
+  try { await debuggerCommand(state.target, 'Network.disable') } catch {}
+}
+
+/** Read the page-created blob spy once and record any blob or download anchor it saw. */
+async function collectCaptureDownloadBlobs(state) {
+  if (!state.spyInstalled) return
+  if (Date.now() - state.lastSpyReadAt < CAPTURE_DOWNLOAD_SPY_READ_MS) return
+  state.lastSpyReadAt = Date.now()
+  let snapshot
+  try {
+    // The wrappers live in the page's own world, so read the state there too.
+    snapshot = await runInFrame(state.tabId, 0, readCaptureDownloadSpy, [], 'MAIN')
+  } catch {
+    return
+  }
+  if (!isRecord(snapshot) || snapshot.active !== true) return
+  const anchors = Array.isArray(snapshot.anchors) ? snapshot.anchors : []
+  for (const anchor of anchors) {
+    const url = captureCandidateUrl(anchor?.href)
+    if (url === undefined || state.seenUrls.has(url)) continue
+    state.seenUrls.add(url)
+    const suggestedFileName = captureSuggestedFileName(anchor?.download)
+    if (/^blob:/iu.test(url)) {
+      await collectCaptureDownloadBlob(state, url, suggestedFileName)
+    } else {
+      recordCaptureDownloadCandidate(state, {
+        source: 'url',
+        via: 'blob-anchor',
+        url,
+        contentType: '',
+        ...(suggestedFileName === undefined ? {} : { suggestedFileName }),
+        observedAt: Number.isFinite(anchor?.at) ? anchor.at : Date.now(),
+      })
+    }
+  }
+  const blobs = Array.isArray(snapshot.blobs) ? snapshot.blobs : []
+  for (const blob of blobs) {
+    const url = captureCandidateUrl(blob?.url)
+    if (url === undefined || !/^blob:/iu.test(url) || state.seenUrls.has(url)) continue
+    const contentType = typeof blob?.type === 'string' ? blob.type : ''
+    // Reading a large blob costs memory, so skip the ones this capture cannot accept.
+    if (!matchesAccept({ contentType, url }, state.accept)) continue
+    state.seenUrls.add(url)
+    await collectCaptureDownloadBlob(state, url)
+  }
+  // A file the page fetched with fetch/XHR: the bytes stay in the page until a
+  // capture accepts this response.
+  const responses = Array.isArray(snapshot.responses) ? snapshot.responses : []
+  for (const response of responses) {
+    const url = captureCandidateUrl(response?.url)
+    if (url === undefined || state.seenUrls.has(url)) continue
+    const contentType = typeof response?.type === 'string' ? response.type : ''
+    if (!matchesAccept({ contentType, url }, state.accept)) continue
+    state.seenUrls.add(url)
+    await collectCaptureDownloadResponse(state, { ...response, url })
+  }
+}
+
+/** Read one page-created blob's bytes inside the page; the model never sees the blob URL. */
+async function collectCaptureDownloadBlob(state, url, suggestedFileName) {
+  let payload
+  try {
+    payload = await runInFrame(state.tabId, 0, fetchFileAsBase64, [url, MAX_FETCH_FILE_BYTES, 'page'])
+  } catch {
+    return
+  }
+  if (!isRecord(payload) || typeof payload.base64 !== 'string') return
+  const bytes = base64ByteLength(payload.base64)
+  if (bytes === 0) return
+  recordCaptureDownloadCandidate(state, {
+    source: 'bytes',
+    via: 'blob-anchor',
+    url,
+    contentType: typeof payload.contentType === 'string' ? payload.contentType : '',
+    contentDisposition: typeof payload.contentDisposition === 'string' ? payload.contentDisposition : '',
+    ...(suggestedFileName === undefined ? {} : { suggestedFileName }),
+    base64: payload.base64,
+    bytes,
+    observedAt: Date.now(),
+  })
+}
+
+/** Read one page-fetched response's bytes from the page and record it as a candidate. */
+async function collectCaptureDownloadResponse(state, response) {
+  let payload
+  try {
+    payload = await runInFrame(state.tabId, 0, readCaptureDownloadResponseBytes, [response.url], 'MAIN')
+  } catch {
+    return
+  }
+  if (!isRecord(payload) || typeof payload.base64 !== 'string') return
+  const bytes = base64ByteLength(payload.base64)
+  if (bytes === 0 || bytes > MAX_FETCH_FILE_BYTES) return
+  recordCaptureDownloadCandidate(state, {
+    source: 'bytes',
+    via: 'response',
+    url: response.url,
+    contentType: typeof payload.contentType === 'string' && payload.contentType !== ''
+      ? payload.contentType
+      : (typeof response.type === 'string' ? response.type : ''),
+    base64: payload.base64,
+    bytes,
+    observedAt: Number.isFinite(response.at) ? response.at : Date.now(),
+  })
+}
+
+/** Read the URL of every tab the click opened, then close that tab. */
+async function collectCaptureDownloadTabs(state) {
+  for (const [openedTabId, recorded] of [...state.openedTabs]) {
+    if (recorded !== undefined) continue
+    let tab
+    try {
+      tab = await chrome.tabs.get(openedTabId)
+    } catch {
+      state.openedTabs.delete(openedTabId)
+      continue
+    }
+    const url = captureCandidateUrl(tab?.pendingUrl) ?? captureCandidateUrl(tab?.url)
+    if (url === undefined) continue
+    state.openedTabs.set(openedTabId, { url })
+    recordCaptureDownloadCandidate(state, {
+      source: 'url',
+      via: 'window-open',
+      url,
+      contentType: '',
+      observedAt: Date.now(),
+    })
+    // The URL has been read; the tab the click opened is no longer needed.
+    await closeCaptureDownloadTab(openedTabId)
+  }
+}
+
+/** Read every source once, including any response body still being fetched. */
+async function collectCaptureDownloadCandidates(state) {
+  await collectCaptureDownloadBlobs(state)
+  await collectCaptureDownloadTabs(state)
+  if (state.pendingBodies.size > 0) await Promise.allSettled([...state.pendingBodies])
+}
+
+/** Choose the first acceptable file, and describe the other acceptable files seen. */
+function chooseCapturedDownload(state) {
+  const choice = selectDownloadCandidate(state.candidates, {
+    accept: state.accept,
+    maxAlso: MAX_CAPTURE_DOWNLOAD_ALSO,
+  })
+  return choice.selected === undefined ? undefined : choice
+}
+
+/** Shape the extension result for the plugin: bytes or a URL, never both, never a page spy. */
+function capturedDownloadResult(state, choice) {
+  const { selected, also } = choice
+  const result = {
+    captured: true,
+    source: selected.source === 'bytes' ? 'bytes' : 'url',
+    via: selected.via,
+    contentType: typeof selected.contentType === 'string' ? selected.contentType : '',
+    ...(typeof selected.contentDisposition === 'string' && selected.contentDisposition !== ''
+      ? { contentDisposition: selected.contentDisposition } : {}),
+    ...(typeof selected.suggestedFileName === 'string' && selected.suggestedFileName !== ''
+      ? { suggestedFileName: selected.suggestedFileName } : {}),
+    ...(typeof selected.url === 'string' ? { url: selected.url } : {}),
+    sourceOrigin: captureSourceOrigin(selected.url),
+    navigated: state.navigated,
+    also,
+  }
+  if (selected.source === 'bytes') {
+    result.base64 = selected.base64
+    result.bytes = selected.bytes
+  }
+  return result
+}
+
+/**
+ * Click one element and capture the file the click produces.
+ *
+ * The four sources are armed before the click and disarmed in a finally:
+ * Chrome downloads (cancelled and erased, so nothing lands on the user's
+ * computer), tabs the click opens (their URL read, then the tab closed),
+ * page-created blobs recorded by a main-world spy (bytes read inside the page),
+ * and network responses fetched with Network.getResponseBody. The first
+ * acceptable file completes the capture and the others are reported as `also`.
+ * Returns a URL for the plugin to fetch, or the bytes themselves; a page that
+ * navigates during the capture is reported with navigated: true and a second
+ * call is the expected retry.
+ */
+async function captureDownload(params, signal) {
+  const tabId = requireTabId(params.tabId)
+  const mode = requireClickTarget(params)
+  const timeoutMs = params.timeoutMs ?? DEFAULT_CAPTURE_DOWNLOAD_TIMEOUT_MS
+  if (!Number.isSafeInteger(timeoutMs) || timeoutMs < 1 || timeoutMs > MAX_CAPTURE_DOWNLOAD_TIMEOUT_MS) {
+    throw new Error('timeoutMs must be an integer between 1 and ' + String(MAX_CAPTURE_DOWNLOAD_TIMEOUT_MS))
+  }
+  const accept = requireCaptureAccept(params.accept)
+  signal?.throwIfAborted()
+  const tab = await chrome.tabs.get(tabId)
+  const tabUrl = typeof tab?.url === 'string' ? tab.url : (typeof tab?.pendingUrl === 'string' ? tab.pendingUrl : '')
+  return withDebugger(tabId, async target => {
+    // Resolve the target before arming: the pointer must land while the capture
+    // is already listening, and resolving can scroll the page.
+    const clickPoint = await resolveClickPoint(tabId, params, mode, target)
+    const state = createCaptureDownloadState({ tabId, tabUrl, tabOrigin: captureSourceOrigin(tabUrl), accept })
+    try {
+      await armCaptureDownloadSources(state, target)
+      await visualCursorMove(tabId, clickPoint.x, clickPoint.y, true)
+      await dispatchClick(target, clickPoint.x, clickPoint.y)
+      const deadline = Date.now() + timeoutMs
+      for (;;) {
+        signal?.throwIfAborted()
+        await collectCaptureDownloadCandidates(state)
+        const choice = chooseCapturedDownload(state)
+        if (choice !== undefined) return capturedDownloadResult(state, choice)
+        const remaining = deadline - Date.now()
+        if (remaining <= 0) {
+          return {
+            captured: false,
+            reason: 'no file within ' + String(timeoutMs) + ' ms',
+            navigated: state.navigated,
+            clicked: true,
+          }
+        }
+        await delay(Math.min(CAPTURE_DOWNLOAD_POLL_MS, remaining), signal ?? new AbortController().signal)
+      }
+    } finally {
+      await disarmCaptureDownloadSources(state)
     }
   })
 }

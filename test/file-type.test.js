@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import { detectKind, expectedKindForMime, expectedKindForName, verifyContent } from '../lib/file-type.js'
+import { MAX_FILE_NAME_CHARS, sanitizeFileName } from '../lib/workspace-file.js'
 
 const bytes = value => Buffer.from(value, 'latin1')
 const PDF = bytes('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj')
@@ -121,6 +122,13 @@ describe('verifyContent', () => {
   it('adds an extension from the content when the name has none', () => {
     assert.equal(verifyContent({ fileName: 'invoice', contentType: 'application/octet-stream', data: PDF }).fileName, 'invoice.pdf')
     assert.equal(verifyContent({ fileName: 'download', contentType: undefined, data: bytes('\0\x01\x02') }).fileName, 'download')
+  })
+
+  it('fits a detected extension into a name at the length limit', () => {
+    const { fileName } = verifyContent({ fileName: 'a'.repeat(MAX_FILE_NAME_CHARS), contentType: 'application/pdf', data: PDF })
+    assert.equal(fileName.length, MAX_FILE_NAME_CHARS)
+    assert.ok(fileName.endsWith('.pdf'))
+    assert.equal(sanitizeFileName(fileName), fileName)
   })
 
   it('reports an unrecognised binary file under a known extension', () => {
