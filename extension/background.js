@@ -1,3 +1,4 @@
+import { MAX_TEXT_CHARS, MAX_XPATH_CHARS, normalizeText, selectElementTarget } from './element-target.js'
 import { DEFAULT_DSH_ORIGIN, normalizeDshOrigin } from './origin.js'
 import { SENSITIVE_QUERY_KEY, elideDataUrl, sanitizeEvaluationValue } from './evaluation-sanitize.js'
 
@@ -494,6 +495,29 @@ function requireCssSelector(value, description = 'The CSS selector') {
   return value
 }
 
+/**
+ * Validate an element target declared by exactly one of selector, xpath, or
+ * visible text, with an optional index for the text and xpath modes.
+ * Returns the mode, or undefined when no element target is declared.
+ */
+function requireTargetDeclaration(params) {
+  const modes = ['selector', 'xpath', 'text'].filter(key => params[key] !== undefined)
+  if (modes.length > 1) throw new Error('Provide only one of selector, xpath, or text')
+  if (params.xpath !== undefined && (typeof params.xpath !== 'string'
+    || params.xpath.trim() === '' || params.xpath.length > MAX_XPATH_CHARS)) {
+    throw new Error('xpath must be a non-empty XPath expression of at most ' + String(MAX_XPATH_CHARS) + ' characters')
+  }
+  if (params.text !== undefined && (typeof params.text !== 'string'
+    || params.text.trim() === '' || params.text.length > MAX_TEXT_CHARS)) {
+    throw new Error('text must be a non-empty string of at most ' + String(MAX_TEXT_CHARS) + ' characters')
+  }
+  if (params.index !== undefined) {
+    if (!Number.isSafeInteger(params.index) || params.index < 0) throw new Error('index must be a non-negative integer')
+    if (params.xpath === undefined && params.text === undefined) throw new Error('index requires xpath or text')
+  }
+  return modes[0]
+}
+
 /** Return the main document's root nodeId. */
 async function rootNodeId(target) {
   const document = await debuggerCommand(target, 'DOM.getDocument', { depth: 0, pierce: true })
@@ -555,6 +579,60 @@ async function resolveElementPoint(target, params) {
   const hitTarget = await callNodeFunction(target, nodeId, CLICK_HIT_TEST_FUNCTION, [x, y])
   if (hitTarget !== true) throw new Error('The selected element is covered at its center point')
   return { x, y }
+}
+
+/**
+ * Resolve an element declaration ({ selector }, { xpath }, or { text, index })
+ * to the viewport point a real pointer action would hit, after scrolling the
+ * element into view, and return its fresh page-side state. Reusable by any tool
+ * that targets an element, including tools that click a target to capture what
+ * it produces.
+ */
+async function resolveElementTarget(tabIdValue, declaration, debuggee) {
+  const tabId = requireTabId(tabIdValue)
+  if (debuggee !== undefined) return resolveElementTargetFor(tabId, declaration, debuggee)
+  return withDebugger(tabId, target => resolveElementTargetFor(tabId, declaration, target))
+}
+
+async function resolveElementTargetFor(tabId, declaration, debuggee) {
+  requireTargetDeclaration(declaration)
+  if (declaration.selector !== undefined) {
+    requireCssSelector(declaration.selector)
+    const point = await resolveElementPoint(debuggee, { selector: declaration.selector })
+    return { mode: 'selector', selector: declaration.selector, x: point.x, y: point.y }
+  }
+  const text = declaration.text === undefined ? undefined : normalizeText(declaration.text)
+  const query = text === undefined ? { xpath: declaration.xpath } : { text }
+  const collected = await runInFrame(tabId, 0, collectTargetCandidates, [query])
+  if (isRecord(collected) && typeof collected.error === 'string') throw new Error(collected.error)
+  if (!isRecord(collected) || !Array.isArray(collected.candidates)) {
+    throw new Error('Chrome returned no element candidates')
+  }
+  const { selected, index } = selectElementTarget(collected.candidates, {
+    text,
+    index: declaration.index,
+    matchCount: collected.matchCount,
+  })
+  const measured = await runInFrame(tabId, 0, measureTargetElement, [selected.xpath])
+  if (!isRecord(measured) || measured.found !== true || !isRecord(measured.center)) {
+    throw new Error('The selected element is no longer in the document')
+  }
+  debuggerTargetsNeedingFreshCoordinates.delete(debuggee)
+  return {
+    mode: text === undefined ? 'xpath' : 'text',
+    xpath: selected.xpath,
+    ...(text === undefined ? {} : { text }),
+    index,
+    x: measured.center.x,
+    y: measured.center.y,
+    bounds: measured.bounds,
+    visible: measured.visible === true,
+    disabled: measured.disabled === true,
+    pointerEvents: measured.pointerEvents,
+    viewportWidth: measured.viewportWidth,
+    viewportHeight: measured.viewportHeight,
+    hit: measured.hit === true,
+  }
 }
 
 /** Resolve a CSS selector against the main document and require exactly one match. */
@@ -638,6 +716,143 @@ const SCROLL_TO_VIEW_FUNCTION = `function () {
       && rect.left < width && rect.top < height,
   }
 }`
+
+/**
+ * Injected into the main frame: describe the elements matching an XPath query
+ * or a visible-text query. Text matching uses the rendered text (whitespace
+ * collapsed, case-insensitive) and page.find's visibility rules. Visible
+ * candidates come first so the pure ranking module and `index` share one stable
+ * list; hidden matches follow so the tool can report that they were skipped.
+ */
+function collectTargetCandidates(query) {
+  const MAX_SCANNED = 50_000
+  const MAX_MATCHES = 10_000
+  const MAX_CANDIDATES = 200
+  const INTERACTIVE_SELECTOR = 'a, button, input[type="submit"], [role="button"]'
+  const collapse = value => String(value ?? '').replace(/\s+/gu, ' ').trim()
+  const renderedText = element => {
+    const inner = element.innerText
+    return typeof inner === 'string' && inner !== '' ? inner : (element.textContent ?? '')
+  }
+  const resolveMatches = () => {
+    if (typeof query.xpath === 'string') {
+      const result = document.evaluate(query.xpath, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null)
+      const matches = []
+      for (let index = 0; index < result.snapshotLength; index++) {
+        const node = result.snapshotItem(index)
+        if (node instanceof Element) matches.push(node)
+        if (matches.length >= MAX_CANDIDATES) break
+      }
+      return matches
+    }
+    const needle = collapse(query.text).toLowerCase()
+    const matches = []
+    let scanned = 0
+    for (const element of document.querySelectorAll('*')) {
+      if (matches.length >= MAX_MATCHES || scanned >= MAX_SCANNED) break
+      scanned++
+      if (collapse(renderedText(element)).toLowerCase().includes(needle)) matches.push(element)
+    }
+    return matches
+  }
+  const absoluteXpath = element => {
+    const parts = []
+    for (let node = element; node !== null && node.nodeType === Node.ELEMENT_NODE; node = node.parentNode) {
+      if (node === document.documentElement) {
+        parts.unshift('html')
+        break
+      }
+      let position = 1
+      for (let sibling = node.previousElementSibling; sibling !== null; sibling = sibling.previousElementSibling) {
+        if (sibling.tagName === node.tagName) position++
+      }
+      parts.unshift(node.tagName.toLowerCase() + '[' + position + ']')
+    }
+    return '/' + parts.join('/')
+  }
+  const depthOf = element => {
+    let depth = 0
+    for (let node = element.parentElement; node !== null; node = node.parentElement) depth++
+    return depth
+  }
+  const matches = (() => {
+    try {
+      return resolveMatches()
+    } catch {
+      return null
+    }
+  })()
+  if (matches === null) return { error: 'The XPath expression is invalid' }
+  const visibleEntries = []
+  const hiddenEntries = []
+  for (const element of matches) {
+    const rect = element.getBoundingClientRect()
+    const style = getComputedStyle(element)
+    const visible = style.display !== 'none' && style.visibility !== 'hidden'
+      && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0
+      && element.getClientRects().length > 0
+    const entry = { element, rect, visible }
+    if (visible) {
+      if (visibleEntries.length < MAX_CANDIDATES) visibleEntries.push(entry)
+    } else if (hiddenEntries.length < MAX_CANDIDATES) hiddenEntries.push(entry)
+  }
+  const visibleElements = visibleEntries.map(entry => entry.element)
+  const describe = (entry, index) => {
+    const rect = entry.rect
+    return {
+      index,
+      tagName: entry.element.tagName.toLowerCase(),
+      role: entry.element.getAttribute('role'),
+      text: collapse(renderedText(entry.element)).slice(0, 300),
+      // Whether this element is itself a control, not merely inside or around
+      // one: the ranking prefers the control, so a span inside a button loses.
+      interactive: entry.element.matches(INTERACTIVE_SELECTOR),
+      visible: entry.visible,
+      bounds: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+      center: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 },
+      xpath: absoluteXpath(entry.element),
+      hasMatchingDescendant: entry.visible
+        && visibleElements.some(other => other !== entry.element && entry.element.contains(other)),
+      depth: depthOf(entry.element),
+    }
+  }
+  return {
+    candidates: visibleEntries.concat(hiddenEntries).map(describe),
+    matchCount: matches.length,
+    truncated: matches.length >= MAX_MATCHES,
+  }
+}
+
+/**
+ * Injected into the main frame: scroll an XPath target into view and measure it.
+ * Re-locating by absolute XPath keeps the second page-side call independent of
+ * the first candidate collection, so a layout change cannot swap the element.
+ */
+function measureTargetElement(xpath) {
+  const node = document.evaluate(xpath, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue
+  if (!(node instanceof Element)) return { found: false }
+  node.scrollIntoView({ block: 'center', inline: 'center', behavior: 'instant' })
+  const rect = node.getBoundingClientRect()
+  const style = getComputedStyle(node)
+  const x = rect.left + rect.width / 2
+  const y = rect.top + rect.height / 2
+  const hit = document.elementFromPoint(x, y)
+  return {
+    found: true,
+    visible: style.display !== 'none' && style.visibility !== 'hidden'
+      && Number(style.opacity) !== 0 && rect.width > 0 && rect.height > 0
+      && node.getClientRects().length > 0,
+    disabled: node.disabled === true || node.matches(':disabled')
+      || node.getAttribute('aria-disabled')?.toLowerCase() === 'true'
+      || node.closest('[inert]') !== null,
+    pointerEvents: style.pointerEvents,
+    bounds: { x: rect.left, y: rect.top, width: rect.width, height: rect.height },
+    center: { x, y },
+    viewportWidth: window.innerWidth,
+    viewportHeight: window.innerHeight,
+    hit: hit === node || (hit !== null && node.contains(hit)),
+  }
+}
 
 /** Runs with `this` bound to the selected field; validates it and selects its text. */
 const FILL_PREPARE_FUNCTION = `function () {
@@ -1123,13 +1338,13 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
     throw new Error('interActionDelayMs must be an integer between 0 and 1000')
   }
   const specs = {
-    click: { method: 'page.click', required: [], allowed: ['selector', 'x', 'y'] },
+    click: { method: 'page.click', required: [], allowed: ['selector', 'xpath', 'text', 'x', 'y', 'index'] },
     type_human: { method: 'page.typeHuman', required: ['text'], allowed: ['text', 'selector', 'delayMs'] },
     fill: { method: 'page.fill', required: ['selector', 'text'], allowed: ['selector', 'text', 'delayMs'] },
     keypress: { method: 'page.keypress', required: ['key'], allowed: ['key'] },
-    mouse_move: { method: 'page.mouseMove', required: [], allowed: ['selector', 'x', 'y'] },
+    mouse_move: { method: 'page.mouseMove', required: [], allowed: ['selector', 'xpath', 'text', 'x', 'y', 'index'] },
     drag: { method: 'page.drag', required: [], allowed: ['fromSelector', 'toSelector', 'fromX', 'fromY', 'toX', 'toY', 'durationMs'] },
-    scroll: { method: 'page.scroll', required: [], allowed: ['selector', 'deltaX', 'deltaY'] },
+    scroll: { method: 'page.scroll', required: [], allowed: ['selector', 'xpath', 'text', 'deltaX', 'deltaY', 'index'] },
     navigate: { method: 'page.navigate', required: ['url'], allowed: ['url'] },
     back: { method: 'page.back', required: [], allowed: [] },
     forward: { method: 'page.forward', required: [], allowed: [] },
@@ -1181,25 +1396,42 @@ function normalizeSequenceCommand(params, defaultDelayMs = DEFAULT_BEHAVIOR_SETT
           : typeof value === expected
       if (!valid) throw new Error('Sequence step ' + String(index + 1) + ' has invalid ' + key)
     }
-    if (step.action === 'click' && stepParams.selector === undefined
-      && !(Number.isFinite(stepParams.x) && Number.isFinite(stepParams.y))) {
-      throw new Error('Sequence click step ' + String(index + 1) + ' requires a selector or both x and y')
+    if (['click', 'mouse_move', 'scroll'].includes(step.action)) {
+      const modes = ['selector', 'xpath', 'text'].filter(key => stepParams[key] !== undefined)
+      if (modes.length > 1) {
+        throw new Error('Sequence ' + step.action + ' step ' + String(index + 1) + ' must use only one of selector, xpath, or text')
+      }
+      if (stepParams.xpath !== undefined && (stepParams.xpath.trim() === '' || stepParams.xpath.length > MAX_XPATH_CHARS)) {
+        throw new Error('Sequence step ' + String(index + 1) + ' has an invalid xpath')
+      }
+      if (stepParams.text !== undefined && (stepParams.text.trim() === '' || stepParams.text.length > MAX_TEXT_CHARS)) {
+        throw new Error('Sequence step ' + String(index + 1) + ' has an invalid text')
+      }
+      if (stepParams.index !== undefined
+        && (stepParams.index < 0 || (stepParams.xpath === undefined && stepParams.text === undefined))) {
+        throw new Error('Sequence step ' + String(index + 1) + ' has an invalid index')
+      }
     }
-    if (step.action === 'click' && stepParams.selector !== undefined
-      && (stepParams.x !== undefined || stepParams.y !== undefined)) {
-      throw new Error('Sequence click step ' + String(index + 1) + ' must use a selector or coordinates, not both')
+    if (step.action === 'click') {
+      const hasElement = ['selector', 'xpath', 'text'].some(key => stepParams[key] !== undefined)
+      if (hasElement && (stepParams.x !== undefined || stepParams.y !== undefined)) {
+        throw new Error('Sequence click step ' + String(index + 1) + ' must use a selector or coordinates, not both')
+      }
+      if (!hasElement && !(Number.isFinite(stepParams.x) && Number.isFinite(stepParams.y))) {
+        throw new Error('Sequence click step ' + String(index + 1) + ' requires a selector or both x and y')
+      }
     }
     if (step.action === 'mouse_move') {
-      const hasSelector = stepParams.selector !== undefined
+      const hasElement = ['selector', 'xpath', 'text'].some(key => stepParams[key] !== undefined)
       const hasCoordinates = stepParams.x !== undefined || stepParams.y !== undefined
-      if (hasSelector === hasCoordinates || (hasCoordinates && !(Number.isFinite(stepParams.x) && Number.isFinite(stepParams.y)))) {
+      if (hasElement === hasCoordinates || (hasCoordinates && !(Number.isFinite(stepParams.x) && Number.isFinite(stepParams.y)))) {
         throw new Error('Sequence mouse_move step ' + String(index + 1) + ' requires a selector or both coordinates')
       }
     }
     if (step.action === 'scroll') {
-      const hasSelector = stepParams.selector !== undefined
+      const hasElement = ['selector', 'xpath', 'text'].some(key => stepParams[key] !== undefined)
       const hasDelta = stepParams.deltaX !== undefined || stepParams.deltaY !== undefined
-      if (hasSelector === hasDelta) throw new Error('Sequence scroll step ' + String(index + 1) + ' requires a selector or scroll deltas')
+      if (hasElement === hasDelta) throw new Error('Sequence scroll step ' + String(index + 1) + ' requires a selector or scroll deltas')
       if ([stepParams.deltaX, stepParams.deltaY].some(value => value !== undefined && Math.abs(value) > 10_000)) {
         throw new Error('Sequence scroll step ' + String(index + 1) + ' has out-of-range deltas')
       }
@@ -1923,10 +2155,11 @@ async function executeBrowserOperationNow(method, params, signal) {
     }
     case 'page.scroll': {
       const tabId = requireTabId(params.tabId)
-      const hasSelector = params.selector !== undefined
+      const mode = requireTargetDeclaration(params)
+      const hasElement = mode !== undefined
       const hasDelta = params.deltaX !== undefined || params.deltaY !== undefined
-      if (hasSelector === hasDelta) throw new Error('Provide a selector or one or both scroll deltas')
-      if (params.selector !== undefined) requireCssSelector(params.selector)
+      if (hasElement === hasDelta) throw new Error('Provide a selector or one or both scroll deltas')
+      if (mode === 'selector') requireCssSelector(params.selector)
       const deltaX = params.deltaX ?? 0
       const deltaY = params.deltaY ?? 0
       if (!Number.isFinite(deltaX) || !Number.isFinite(deltaY)
@@ -1934,7 +2167,21 @@ async function executeBrowserOperationNow(method, params, signal) {
         throw new Error('Scroll deltas must be between -10000 and 10000')
       }
       return withDebugger(tabId, async target => {
-        if (hasSelector) {
+        if (mode === 'xpath' || mode === 'text') {
+          const resolved = await resolveElementTarget(tabId, params, target)
+          if (resolved.visible !== true) {
+            throw new Error('The selected element could not be brought into the viewport')
+          }
+          return {
+            tabId, scrolled: true, xpath: resolved.xpath,
+            ...(mode === 'text' ? { text: resolved.text } : {}),
+            index: resolved.index,
+            x: resolved.x, y: resolved.y,
+            viewportWidth: resolved.viewportWidth,
+            viewportHeight: resolved.viewportHeight,
+          }
+        }
+        if (mode === 'selector') {
           const nodeId = await querySelectorNode(target, params.selector)
           const info = await callNodeFunction(target, nodeId, SCROLL_TO_VIEW_FUNCTION)
           if (!isRecord(info) || info.visible !== true) {
@@ -1962,18 +2209,43 @@ async function executeBrowserOperationNow(method, params, signal) {
     }
     case 'page.click': {
       const tabId = requireTabId(params.tabId)
-      const hasSelector = params.selector !== undefined
+      const mode = requireTargetDeclaration(params)
+      const hasSelector = mode === 'selector'
+      const hasElement = mode !== undefined
       const hasCoords = Number.isFinite(params.x) && Number.isFinite(params.y)
       const animate = true
       if (hasSelector) requireCssSelector(params.selector)
-      if (!hasSelector && !hasCoords) throw new Error('Provide a CSS selector or x and y click coordinates')
+      if (hasElement && (params.x !== undefined || params.y !== undefined)) {
+        throw new Error('Provide a selector, xpath, or text, or x and y click coordinates, not both')
+      }
+      if (!hasElement && !hasCoords) throw new Error('Provide a CSS selector or x and y click coordinates')
       if (hasCoords && (params.x < 0 || params.y < 0 || params.x > 10000 || params.y > 10000)) {
         throw new Error('Click coordinates must be between 0 and 10000')
       }
       return withDebugger(tabId, async target => {
         let x = params.x
         let y = params.y
-        if (hasSelector) {
+        let elementResult = {}
+        if (mode === 'xpath' || mode === 'text') {
+          const resolved = await resolveElementTarget(tabId, params, target)
+          if (resolved.visible !== true) {
+            throw new Error('The selected element could not be brought into the viewport')
+          }
+          if (resolved.disabled === true) throw new Error('The selected element is disabled')
+          if (resolved.pointerEvents === 'none') throw new Error('The selected element does not receive pointer events')
+          if (resolved.x < 0 || resolved.y < 0
+            || resolved.x >= resolved.viewportWidth || resolved.y >= resolved.viewportHeight) {
+            throw new Error('The selected element is outside the viewport after scrolling')
+          }
+          if (resolved.hit !== true) throw new Error('The selected element is covered at its click point')
+          x = resolved.x
+          y = resolved.y
+          elementResult = {
+            xpath: resolved.xpath,
+            ...(mode === 'text' ? { text: resolved.text } : {}),
+            index: resolved.index,
+          }
+        } else if (hasSelector) {
           const nodeId = await querySelectorNode(target, params.selector)
           const scrollInfo = await callNodeFunction(target, nodeId, SCROLL_TO_VIEW_FUNCTION)
           if (!isRecord(scrollInfo) || scrollInfo.visible !== true) {
@@ -2017,7 +2289,10 @@ async function executeBrowserOperationNow(method, params, signal) {
         await debuggerCommand(target, 'Input.dispatchMouseEvent', {
           type: 'mouseReleased', x, y, button: 'left', clickCount: 1,
         })
-        return { tabId, clicked: true, ...(hasSelector ? { selector: params.selector } : {}), x, y }
+        return {
+          tabId, clicked: true, ...elementResult,
+          ...(hasSelector ? { selector: params.selector } : {}), x, y,
+        }
       })
     }
     case 'page.drag': {
@@ -2162,9 +2437,11 @@ async function executeBrowserOperationNow(method, params, signal) {
     }
     case 'page.mouseMove': {
       const tabId = requireTabId(params.tabId)
-      const hasSelector = params.selector !== undefined
+      const mode = requireTargetDeclaration(params)
+      const hasSelector = mode === 'selector'
+      const hasElement = mode !== undefined
       const hasCoordinates = params.x !== undefined || params.y !== undefined
-      if (hasSelector === hasCoordinates) throw new Error('Provide a CSS selector or both x and y mouse coordinates')
+      if (hasElement === hasCoordinates) throw new Error('Provide a CSS selector or both x and y mouse coordinates')
       if (hasSelector) requireCssSelector(params.selector)
       if (hasCoordinates && (!Number.isFinite(params.x) || !Number.isFinite(params.y)
         || params.x < 0 || params.y < 0 || params.x > 10000 || params.y > 10000)) {
@@ -2174,7 +2451,26 @@ async function executeBrowserOperationNow(method, params, signal) {
       return withDebugger(tabId, async target => {
         let x = params.x
         let y = params.y
-        if (hasSelector) {
+        let elementResult = {}
+        if (mode === 'xpath' || mode === 'text') {
+          const resolved = await resolveElementTarget(tabId, params, target)
+          if (resolved.visible !== true) {
+            throw new Error('The selected element could not be brought into the viewport')
+          }
+          if (resolved.pointerEvents === 'none') throw new Error('The selected element is not reachable at its center point')
+          if (resolved.x < 0 || resolved.y < 0
+            || resolved.x >= resolved.viewportWidth || resolved.y >= resolved.viewportHeight) {
+            throw new Error('The selected element is outside the viewport after scrolling')
+          }
+          if (resolved.hit !== true) throw new Error('The selected element is covered at its center point')
+          x = resolved.x
+          y = resolved.y
+          elementResult = {
+            xpath: resolved.xpath,
+            ...(mode === 'text' ? { text: resolved.text } : {}),
+            index: resolved.index,
+          }
+        } else if (hasSelector) {
           const point = await resolveElementPoint(target, { selector: params.selector })
           x = point.x
           y = point.y
@@ -2190,7 +2486,10 @@ async function executeBrowserOperationNow(method, params, signal) {
         await debuggerCommand(target, 'Input.dispatchMouseEvent', {
           type: 'mouseMoved', x, y, button: 'none', buttons: 0, modifiers: 0,
         })
-        return { tabId, moved: true, ...(hasSelector ? { selector: params.selector } : {}), x, y, animated: animate }
+        return {
+          tabId, moved: true, ...elementResult,
+          ...(hasSelector ? { selector: params.selector } : {}), x, y, animated: animate,
+        }
       })
     }
     case 'page.fill': {
