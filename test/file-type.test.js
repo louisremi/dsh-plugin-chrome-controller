@@ -6,6 +6,14 @@ const bytes = value => Buffer.from(value, 'latin1')
 const PDF = bytes('%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj')
 const PNG = bytes('\x89PNG\r\n\x1a\n\0\0\0\rIHDR')
 const ZIP = bytes('PK\x03\x04\x14\0\0\0')
+// A stored (uncompressed) ZIP whose first member is a PDF, as La Poste builds its
+// multi-invoice downloads: the member's bytes follow the 30-byte local header and
+// the member name, so "%PDF-" appears near the start of the ZIP.
+const STORED_ZIP_MEMBER_NAME = '1795364068906-0.pdf'
+const STORED_ZIP_HEADER = Buffer.alloc(30)
+STORED_ZIP_HEADER.write('PK\x03\x04', 'latin1')
+STORED_ZIP_HEADER.writeUInt16LE(STORED_ZIP_MEMBER_NAME.length, 26)
+const STORED_ZIP_WITH_PDF = Buffer.concat([STORED_ZIP_HEADER, Buffer.from(STORED_ZIP_MEMBER_NAME), bytes('%PDF-1.7\n...')])
 // Shape of the page amazon.fr returned with HTTP 200 for an expired invoice link.
 const AMAZON_ERROR = bytes('\n\n<html>\n<head>\n<title>Toutes nos excuses</title>\n<style><!--\n.serif { font-family: times,serif; }\n--></style>\n</head>\n<body>Une erreur de syst&egrave;me interne a &eacute;t&eacute; d&eacute;cel&eacute;e.</body></html>')
 
@@ -22,6 +30,16 @@ describe('content detection', () => {
 
   it('accepts a PDF header after leading junk, as PDF readers do', () => {
     assert.equal(detectKind(bytes('\r\n\r\n%PDF-1.7')), 'pdf')
+  })
+
+  it('still detects a PDF behind 200 bytes of non-whitespace junk, not just spaces', () => {
+    const junk = bytes('junk '.repeat(40))
+    assert.equal(junk.length, 200)
+    assert.equal(detectKind(Buffer.concat([junk, PDF])), 'pdf')
+  })
+
+  it('recognises a stored ZIP whose first member is a PDF as a ZIP, not a PDF', () => {
+    assert.equal(detectKind(STORED_ZIP_WITH_PDF), 'zip')
   })
 
   it('recognises HTML pages, including with a BOM, whitespace, or uppercase tags', () => {
@@ -58,6 +76,16 @@ describe('verifyContent', () => {
     assert.deepEqual(verifyContent({ fileName: 'a.pdf', contentType: 'application/pdf', data: PDF }), { fileName: 'a.pdf', kind: 'pdf' })
     assert.equal(verifyContent({ fileName: 'r.xlsx', contentType: 'application/octet-stream', data: ZIP }).fileName, 'r.xlsx')
     assert.equal(verifyContent({ fileName: 'a.csv', contentType: 'text/csv', data: bytes('a,b\n1,2\n') }).fileName, 'a.csv')
+  })
+
+  it('accepts a stored ZIP of PDFs under .zip or with a declared application/zip', () => {
+    assert.deepEqual(verifyContent({ fileName: 'lot.zip', contentType: 'application/zip', data: STORED_ZIP_WITH_PDF }), { fileName: 'lot.zip', kind: 'zip' })
+    assert.deepEqual(verifyContent({ fileName: 'lot.bin', contentType: 'application/zip', data: STORED_ZIP_WITH_PDF }), { fileName: 'lot.bin', kind: 'zip' })
+  })
+
+  it('still verifies Office ZIP containers', () => {
+    assert.deepEqual(verifyContent({ fileName: 'report.docx', contentType: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document', data: ZIP }), { fileName: 'report.docx', kind: 'zip' })
+    assert.deepEqual(verifyContent({ fileName: 'report.xlsx', contentType: 'application/octet-stream', data: ZIP }), { fileName: 'report.xlsx', kind: 'zip' })
   })
 
   it('refuses an HTML error page saved as a PDF, naming its title', () => {
